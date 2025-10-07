@@ -66,6 +66,11 @@ def forecast():
         "confidence": confidence
     })
 
+@app.route("/")
+def home():
+    return jsonify({"message": "Dental Forecast API is running 🚀"})
+
+
 # ✅ Return cleaned treatment list
 @app.route("/treatments", methods=["GET"])
 def get_treatments():
@@ -75,3 +80,4 @@ if __name__ == "__main__":
     # Render sets PORT automatically — use that if available
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
