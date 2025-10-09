@@ -1,99 +1,72 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
-from difflib import SequenceMatcher, get_close_matches
 import os
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
 
 app = Flask(__name__)
-
-# ✅ Allow CORS from anywhere (so Hostinger frontend can connect)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# ✅ Load dataset from the same directory (works on Render)
+# ✅ Load dataset
 FILE_PATH = os.path.join(os.path.dirname(__file__), "dental_health_forecasting.xlsx")
 df = pd.read_excel(FILE_PATH)
 
-# ✅ Clean treatments
-def clean_treatments(treatments):
-    unique = []
-    for t in treatments:
-        t = str(t).strip().lower()
-        if not t or t == "nan":
-            continue
-        close = get_close_matches(t, unique, n=1, cutoff=0.85)
-        if not close:
-            unique.append(t)
-    return sorted([t.title() for t in unique])
+# ✅ Basic cleaning
+df = df.dropna(subset=["Diagnosis"])
+df["Symptoms"] = df["Symptoms"].fillna("")
+df["Treatment"] = df["Treatment"].fillna("")
+df["input_text"] = df["Symptoms"] + " " + df["Treatment"]
 
-cleaned_treatments = clean_treatments(df["Treatment"].dropna().unique())
+# ✅ Split data (for internal validation — not necessary for prediction)
+X_train, X_test, y_train, y_test = train_test_split(
+    df["input_text"], df["Diagnosis"], test_size=0.2, random_state=42
+)
 
-# 🔮 Forecast route
+# ✅ Create ML pipeline
+model = Pipeline([
+    ("tfidf", TfidfVectorizer(stop_words="english")),
+    ("clf", LogisticRegression(max_iter=1000))
+])
+
+# ✅ Train model
+model.fit(X_train, y_train)
+
+# ✅ For dropdowns
+unique_treatments = sorted(df["Treatment"].dropna().unique().tolist())
+
+@app.route("/")
+def home():
+    return jsonify({"message": "Dental Forecast ML API is running 🚀"})
+
+@app.route("/treatments", methods=["GET"])
+def treatments():
+    return jsonify(unique_treatments)
+
 @app.route("/forecast", methods=["POST"])
 def forecast():
     data = request.get_json()
-    year = data.get("year")
-    month = data.get("month")
-    treatment_input = data.get("treatment", "").strip().lower()
-    symptom_input = data.get("symptom", "").strip().lower()
+    treatment_input = data.get("treatment", "").strip()
+    symptom_input = data.get("symptom", "").strip()
 
-    if not treatment_input and not symptom_input:
-        return jsonify({"error": "Missing treatment or symptom"}), 400
+    if not symptom_input and not treatment_input:
+        return jsonify({"error": "Please provide at least one symptom or treatment."}), 400
 
-    # 🧠 Compute similarity based on both inputs (symptom more important)
-    df["Treatment_Similarity"] = df["Treatment"].fillna("").apply(
-        lambda t: SequenceMatcher(None, treatment_input, t.lower()).ratio()
-    )
-    df["Symptom_Similarity"] = df["Symptoms"].fillna("").apply(
-        lambda s: SequenceMatcher(None, symptom_input, s.lower()).ratio()
-    )
+    # Combine both text fields for prediction
+    input_text = f"{symptom_input} {treatment_input}".strip()
 
-    # Weighted more toward symptom similarity
-    df["Overall_Similarity"] = (df["Treatment_Similarity"] * 0.4) + (df["Symptom_Similarity"] * 0.6)
-
-    # Pick matches above a lower threshold to allow flexible matches
-    similar_rows = df[df["Overall_Similarity"] > 0.2]
-
-    if similar_rows.empty:
-        # Try again using only symptom similarity
-        symptom_only = df[df["Symptom_Similarity"] > 0.25]
-        if not symptom_only.empty:
-            top_match = symptom_only.sort_values("Symptom_Similarity", ascending=False).iloc[0]
-            diagnosis = top_match["Diagnosis"]
-            confidence = round(float(top_match["Symptom_Similarity"]), 2)
-            return jsonify({
-                "predicted_diagnosis": diagnosis,
-                "confidence": confidence
-            })
-        # No match at all
-        return jsonify({
-            "predicted_diagnosis": "General dental check-up",
-            "confidence": 0.0
-        })
-
-    # ✅ Get the best match from combined similarity
-    top_match = similar_rows.sort_values("Overall_Similarity", ascending=False).iloc[0]
-    diagnosis = top_match["Diagnosis"]
-    confidence = round(float(top_match["Overall_Similarity"]), 2)
+    # ✅ Predict diagnosis
+    predicted_diagnosis = model.predict([input_text])[0]
+    confidence = round(float(max(model.predict_proba([input_text])[0])), 2)
 
     return jsonify({
-        "predicted_diagnosis": diagnosis,
+        "predicted_diagnosis": predicted_diagnosis,
         "confidence": confidence
     })
 
 
-@app.route("/")
-def home():
-    return jsonify({"message": "Dental Forecast API is running 🚀"})
-
-
-# ✅ Return cleaned treatment list
-@app.route("/treatments", methods=["GET"])
-def get_treatments():
-    return jsonify(cleaned_treatments)
-
 if __name__ == "__main__":
-    # Render sets PORT automatically — use that if available
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-
