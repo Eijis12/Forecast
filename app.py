@@ -38,13 +38,16 @@ model.fit(X_train, y_train)
 
 unique_treatments = sorted(df["Treatment"].dropna().unique().tolist())
 
+
 @app.route("/")
 def home():
     return jsonify({"message": "Dental Forecast ML API is running 🚀"})
 
+
 @app.route("/api/treatments", methods=["GET"])
 def treatments():
     return jsonify(unique_treatments)
+
 
 @app.route("/api/forecast", methods=["POST"])
 def forecast():
@@ -69,17 +72,29 @@ def forecast():
 REVENUE_FILE = os.path.join(os.path.dirname(__file__), "DentalRecords_RevenueForecasting.xlsx")
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "forecast_results.xlsx")
 
+
 def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     df = pd.read_excel(file_path)
+
+    # detect amount column
     amount_col = [c for c in df.columns if 'amount' in c.lower()][0]
 
+    # ✅ FIXED: Create DATE using YEAR, MONTH, DAY
     if 'DATE' not in df.columns:
-        if all(col in df.columns for col in ['YEAR', 'MONTH']):
+        if all(col in df.columns for col in ['YEAR', 'MONTH', 'DAY']):
+            df['DATE'] = pd.to_datetime(
+                df['YEAR'].astype(str) + '-' +
+                df['MONTH'].astype(str) + '-' +
+                df['DAY'].astype(str)
+            )
+        elif all(col in df.columns for col in ['YEAR', 'MONTH']):
             df['DATE'] = pd.to_datetime(df['YEAR'].astype(str) + '-' + df['MONTH'].astype(str) + '-01')
         else:
-            raise ValueError("No DATE or YEAR/MONTH columns found in dataset.")
+            raise ValueError("No DATE or YEAR/MONTH/DAY columns found in dataset.")
+
     df['DATE'] = pd.to_datetime(df['DATE'])
 
+    # aggregate by day
     daily = df.groupby(pd.Grouper(key='DATE', freq='D'))[amount_col].sum().fillna(0)
     daily = daily.asfreq('D').fillna(method='ffill')
 
@@ -109,12 +124,12 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
 
     preds = model.predict(future_data[['dayofweek', 'month', 'year']])
 
+    # Add scaling and random variation
     target_total = random.uniform(50000, 100000)
     preds = preds / preds.sum() * target_total
 
     sunday_mask = future_data['dayofweek'] == 6
     preds[sunday_mask] = 0
-
     preds = preds * np.random.uniform(0.9, 1.1, size=len(preds))
 
     forecast_df = pd.Series(preds, index=future_data['date']).round(2)
@@ -178,36 +193,8 @@ def revenue_history():
 
 
 # =========================================================
-# ✅ NEW: DOWNLOAD FORECAST (Save Button)
+# ✅ DOWNLOAD FORECAST
 # =========================================================
-@app.route("/api/revenue/download", methods=["GET"])
-def download_forecast():
-    """Generate and send forecast file as Excel."""
-    try:
-        result = forecast_next_month()
-        df = pd.DataFrame({
-            "Date": list(result["daily_forecast"].keys()),
-            "Predicted_Revenue": list(result["daily_forecast"].values()),
-            "Lower_Bound": list(result["confidence_intervals"]["lower"].values()),
-            "Upper_Bound": list(result["confidence_intervals"]["upper"].values())
-        })
-
-        output = io.BytesIO()
-        df.to_excel(output, index=False)
-        output.seek(0)
-
-        filename = f"RevenueForecast_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        return send_file(
-            output,
-            as_attachment=True,
-            download_name=filename,
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
 @app.route("/api/revenue/download", methods=["GET"])
 def download_forecast_file():
     try:
@@ -215,6 +202,7 @@ def download_forecast_file():
             return jsonify({"status": "error", "message": "No forecast file found."}), 404
         return send_file(HISTORY_FILE, as_attachment=True)
     except Exception as e:
+        traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -224,4 +212,3 @@ def download_forecast_file():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
