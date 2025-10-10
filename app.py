@@ -208,9 +208,20 @@ def download_forecast():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route("/api/revenue/download", methods=["GET"])
+def download_forecast_file():
+    try:
+        if not os.path.exists(HISTORY_FILE):
+            return jsonify({"status": "error", "message": "No forecast file found."}), 404
+        return send_file(HISTORY_FILE, as_attachment=True)
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 # =========================================================
 # ✅ RUN APP
 # =========================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
