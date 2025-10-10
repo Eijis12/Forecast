@@ -174,10 +174,24 @@ def revenue_forecast():
         print("⚙️ Starting revenue forecast...")
         result = forecast_next_month()
         print("✅ Forecast complete!")
+
+        # ✅ Convert Timestamps → strings for JSON
+        daily_forecast_str = {d.strftime("%Y-%m-%d"): v for d, v in pd.Series(result["daily_forecast"]).items()}
+        conf_lower_str = {d.strftime("%Y-%m-%d"): v for d, v in pd.Series(result["confidence_intervals"]["lower"]).items()}
+        conf_upper_str = {d.strftime("%Y-%m-%d"): v for d, v in pd.Series(result["confidence_intervals"]["upper"]).items()}
+
         return jsonify({
             "status": "success",
             "message": "Revenue forecast generated successfully",
-            "data": result
+            "data": {
+                "next_month_total": result["next_month_total"],
+                "daily_forecast": daily_forecast_str,
+                "confidence_intervals": {
+                    "lower": conf_lower_str,
+                    "upper": conf_upper_str
+                },
+                "generated_at": datetime.datetime.utcnow().isoformat() + "Z"
+            }
         })
     except Exception as e:
         print("❌ Forecast failed:")
@@ -211,3 +225,4 @@ def revenue_history():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
