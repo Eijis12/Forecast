@@ -69,37 +69,42 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     df = pd.read_excel(file_path)
     amount_col = [c for c in df.columns if 'amount' in c.lower()][0]
 
+    # --- Handle date/time ---
     if 'DATE' not in df.columns:
         if all(col in df.columns for col in ['YEAR', 'MONTH']):
             df['DATE'] = pd.to_datetime(df['YEAR'].astype(str) + '-' + df['MONTH'].astype(str) + '-01')
         else:
             raise ValueError("No DATE or YEAR/MONTH columns found in dataset.")
 
-    monthly = df.groupby(pd.Grouper(key='DATE', freq='M'))[amount_col].sum().sort_index()
-    rows = []
-    for m, total in monthly.items():
-        days = pd.date_range(start=m.to_period('M').to_timestamp(), end=m + pd.offsets.MonthEnd(0), freq='D')
-        share = total / len(days)
-        for d in days:
-            rows.append((d, share))
-    daily = pd.DataFrame(rows, columns=['DATE', 'AMOUNT']).set_index('DATE')
+    # --- Group to daily totals ---
+    daily = df.groupby(pd.Grouper(key='DATE', freq='D'))[amount_col].sum().fillna(0)
+    daily = daily.asfreq('D').fillna(method='ffill')
 
-    np.random.seed(0)
-    daily['AMOUNT'] += np.random.normal(scale=0.03 * daily['AMOUNT'].mean(), size=len(daily))
-    daily['AMOUNT'] = np.maximum(daily['AMOUNT'], 0)
+    # --- FAST FORECAST MODEL (simple trend + rolling mean) ---
+    rolling_mean = daily.rolling(window=7, min_periods=1).mean()
+    trend = np.linspace(1, 1.05, len(rolling_mean))  # simple upward trend
+    adjusted = rolling_mean * trend
 
-    model = SARIMAX(daily['AMOUNT'], order=(1,1,1), seasonal_order=(1,1,1,7))
-    res = model.fit(disp=False)
-    forecast = res.get_forecast(steps=steps)
-    mean_forecast = forecast.predicted_mean
-    conf_int = forecast.conf_int()
-    total_forecast = mean_forecast.sum()
+    last_value = adjusted.iloc[-1]
+    forecast_values = np.linspace(last_value, last_value * 1.05, steps)  # small linear increase
+
+    forecast_dates = pd.date_range(start=daily.index[-1] + pd.Timedelta(days=1), periods=steps, freq='D')
+
+    forecast_df = pd.Series(forecast_values, index=forecast_dates)
+    total_forecast = forecast_df.sum()
+
+    conf_lower = forecast_df * 0.9
+    conf_upper = forecast_df * 1.1
 
     return {
         "next_month_total": round(total_forecast, 2),
-        "daily_forecast": mean_forecast.round(2).to_dict(),
-        "confidence_intervals": conf_int.round(2).to_dict()
+        "daily_forecast": forecast_df.round(2).to_dict(),
+        "confidence_intervals": {
+            "lower": conf_lower.round(2).to_dict(),
+            "upper": conf_upper.round(2).to_dict()
+        }
     }
+
 
 import traceback
 
@@ -126,4 +131,5 @@ def revenue_forecast():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
