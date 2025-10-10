@@ -101,21 +101,29 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
         "confidence_intervals": conf_int.round(2).to_dict()
     }
 
+import traceback
+
 @app.route("/api/revenue/forecast", methods=["GET"])
 def revenue_forecast():
     try:
+        print("⚙️ Starting revenue forecast...")
         result = forecast_next_month()
+        print("✅ Forecast complete!")
         return jsonify({
             "status": "success",
             "message": "Revenue forecast generated successfully",
             "data": result
         })
     except Exception as e:
+        print("❌ Forecast failed:")
+        traceback.print_exc()  # <-- shows the real error
         return jsonify({
             "status": "error",
             "message": str(e)
         }), 500
 
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
