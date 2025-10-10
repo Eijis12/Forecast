@@ -11,6 +11,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
 import lightgbm as lgb
+import json
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -63,12 +64,13 @@ def forecast():
         "confidence": confidence
     })
 
+
 # =========================================================
 # ✅ 2. REVENUE FORECASTING (LightGBM + Realistic Scale + Save)
 # =========================================================
 REVENUE_FILE = os.path.join(os.path.dirname(__file__), "DentalRecords_RevenueForecasting.xlsx")
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "forecast_results.xlsx")
-
+JSON_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "forecast_history.json")
 
 def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     df = pd.read_excel(file_path)
@@ -141,7 +143,7 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     conf_lower = (forecast_df * 0.9).round(2)
     conf_upper = (forecast_df * 1.1).round(2)
 
-    # --- Save forecast results ---
+    # --- Save forecast results (Excel) ---
     save_df = pd.DataFrame({
         "Date": forecast_df.index.strftime("%Y-%m-%d"),
         "Predicted_Revenue": forecast_df.values,
@@ -175,10 +177,10 @@ def revenue_forecast():
         result = forecast_next_month()
         print("✅ Forecast complete!")
 
-        # ✅ Convert Timestamps → strings for JSON
-        daily_forecast_str = {d.strftime("%Y-%m-%d"): v for d, v in pd.Series(result["daily_forecast"]).items()}
-        conf_lower_str = {d.strftime("%Y-%m-%d"): v for d, v in pd.Series(result["confidence_intervals"]["lower"]).items()}
-        conf_upper_str = {d.strftime("%Y-%m-%d"): v for d, v in pd.Series(result["confidence_intervals"]["upper"]).items()}
+        # Convert timestamps for JSON
+        daily_forecast_str = {str(d): v for d, v in result["daily_forecast"].items()}
+        conf_lower_str = {str(d): v for d, v in result["confidence_intervals"]["lower"].items()}
+        conf_upper_str = {str(d): v for d, v in result["confidence_intervals"]["upper"].items()}
 
         return jsonify({
             "status": "success",
@@ -196,20 +198,14 @@ def revenue_forecast():
     except Exception as e:
         print("❌ Forecast failed:")
         traceback.print_exc()
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route("/api/revenue/history", methods=["GET"])
 def revenue_history():
     """Returns saved forecast history"""
     if not os.path.exists(HISTORY_FILE):
-        return jsonify({
-            "status": "empty",
-            "message": "No forecast history found yet."
-        })
+        return jsonify({"status": "empty", "message": "No forecast history found yet."})
     df = pd.read_excel(HISTORY_FILE)
     records = df.to_dict(orient="records")
     return jsonify({
@@ -220,9 +216,40 @@ def revenue_history():
 
 
 # =========================================================
-# ✅ 4. RUN APP
+# ✅ 4. SAVE FORECAST ENDPOINT (for Save Button)
+# =========================================================
+@app.route("/api/revenue/save_forecast", methods=["POST"])
+def save_forecast():
+    """Saves forecast summary to JSON file (used by Save button)."""
+    try:
+        data = request.get_json(force=True)
+        if not data or "next_month_total" not in data:
+            return jsonify({"status": "error", "message": "Missing forecast data"}), 400
+
+        record = {
+            "saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total": float(data["next_month_total"])
+        }
+
+        # Load existing history or create new
+        if os.path.exists(JSON_HISTORY_FILE):
+            with open(JSON_HISTORY_FILE, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        else:
+            history = []
+
+        history.append(record)
+        with open(JSON_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+
+        return jsonify({"status": "success", "message": "Forecast saved successfully"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# =========================================================
+# ✅ 5. RUN APP
 # =========================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
