@@ -1,6 +1,8 @@
 flask
 flask-cors
 pandas
+numpy
 openpyxl
 scikit-learn
 statsmodels
+gunicorn
