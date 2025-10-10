@@ -8,6 +8,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
 from statsmodels.tsa.statespace.sarimax import SARIMAX
+import traceback
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -60,6 +61,7 @@ def forecast():
         "confidence": confidence
     })
 
+
 # =========================================================
 # ✅ 2. REVENUE FORECASTING ENDPOINT
 # =========================================================
@@ -96,17 +98,20 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     conf_lower = forecast_df * 0.9
     conf_upper = forecast_df * 1.1
 
+    # --- ✅ Convert datetime index to strings for JSON ---
+    forecast_dict = {d.strftime("%Y-%m-%d"): float(v) for d, v in forecast_df.items()}
+    conf_lower_dict = {d.strftime("%Y-%m-%d"): float(v) for d, v in conf_lower.items()}
+    conf_upper_dict = {d.strftime("%Y-%m-%d"): float(v) for d, v in conf_upper.items()}
+
     return {
         "next_month_total": round(total_forecast, 2),
-        "daily_forecast": forecast_df.round(2).to_dict(),
+        "daily_forecast": forecast_dict,
         "confidence_intervals": {
-            "lower": conf_lower.round(2).to_dict(),
-            "upper": conf_upper.round(2).to_dict()
+            "lower": conf_lower_dict,
+            "upper": conf_upper_dict
         }
     }
 
-
-import traceback
 
 @app.route("/api/revenue/forecast", methods=["GET"])
 def revenue_forecast():
@@ -121,15 +126,16 @@ def revenue_forecast():
         })
     except Exception as e:
         print("❌ Forecast failed:")
-        traceback.print_exc()  # <-- shows the real error
+        traceback.print_exc()
         return jsonify({
             "status": "error",
             "message": str(e)
         }), 500
 
 
+# =========================================================
+# ✅ 3. MAIN APP ENTRY POINT
+# =========================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-
