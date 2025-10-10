@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
@@ -11,7 +11,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
 import lightgbm as lgb
-import json
+import io
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -22,13 +22,11 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 FILE_PATH = os.path.join(os.path.dirname(__file__), "dental_health_forecasting.xlsx")
 df = pd.read_excel(FILE_PATH)
 
-# Basic cleaning
 df = df.dropna(subset=["Diagnosis"])
 df["Symptoms"] = df["Symptoms"].fillna("")
 df["Treatment"] = df["Treatment"].fillna("")
 df["input_text"] = df["Symptoms"] + " " + df["Treatment"]
 
-# Train model
 X_train, X_test, y_train, y_test = train_test_split(
     df["input_text"], df["Diagnosis"], test_size=0.2, random_state=42
 )
@@ -66,17 +64,15 @@ def forecast():
 
 
 # =========================================================
-# ✅ 2. REVENUE FORECASTING (LightGBM + Realistic Scale + Save)
+# ✅ 2. REVENUE FORECASTING
 # =========================================================
 REVENUE_FILE = os.path.join(os.path.dirname(__file__), "DentalRecords_RevenueForecasting.xlsx")
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "forecast_results.xlsx")
-JSON_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "forecast_history.json")
 
 def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     df = pd.read_excel(file_path)
     amount_col = [c for c in df.columns if 'amount' in c.lower()][0]
 
-    # --- Handle date ---
     if 'DATE' not in df.columns:
         if all(col in df.columns for col in ['YEAR', 'MONTH']):
             df['DATE'] = pd.to_datetime(df['YEAR'].astype(str) + '-' + df['MONTH'].astype(str) + '-01')
@@ -84,11 +80,9 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
             raise ValueError("No DATE or YEAR/MONTH columns found in dataset.")
     df['DATE'] = pd.to_datetime(df['DATE'])
 
-    # --- Group daily totals ---
     daily = df.groupby(pd.Grouper(key='DATE', freq='D'))[amount_col].sum().fillna(0)
     daily = daily.asfreq('D').fillna(method='ffill')
 
-    # --- Prepare features ---
     data = pd.DataFrame({
         'date': daily.index,
         'revenue': daily.values,
@@ -100,20 +94,12 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     X = data[['dayofweek', 'month', 'year']]
     y = data['revenue']
 
-    # --- Train model ---
-    model = lgb.LGBMRegressor(
-        n_estimators=100,
-        learning_rate=0.05,
-        num_leaves=31,
-        random_state=42
-    )
+    model = lgb.LGBMRegressor(n_estimators=100, learning_rate=0.05, num_leaves=31, random_state=42)
     model.fit(X, y)
 
-    # --- Forecast from current date ---
     today = pd.Timestamp.now().normalize()
     forecast_dates = pd.date_range(start=today + pd.Timedelta(days=1), periods=steps, freq='D')
 
-    # --- Predict ---
     future_data = pd.DataFrame({
         'date': forecast_dates,
         'dayofweek': forecast_dates.dayofweek,
@@ -123,27 +109,19 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
 
     preds = model.predict(future_data[['dayofweek', 'month', 'year']])
 
-    # --- Scale realistically (₱50k–₱100k total) ---
     target_total = random.uniform(50000, 100000)
-    preds = np.array(preds)
     preds = preds / preds.sum() * target_total
 
-    # --- Sunday (closed, dayofweek == 6) ---
     sunday_mask = future_data['dayofweek'] == 6
     preds[sunday_mask] = 0
 
-    # --- Add daily variation ---
-    variation = np.random.uniform(0.9, 1.1, size=len(preds))
-    preds = preds * variation
+    preds = preds * np.random.uniform(0.9, 1.1, size=len(preds))
 
     forecast_df = pd.Series(preds, index=future_data['date']).round(2)
     total_forecast = forecast_df.sum().round(2)
-
-    # --- Confidence intervals ---
     conf_lower = (forecast_df * 0.9).round(2)
     conf_upper = (forecast_df * 1.1).round(2)
 
-    # --- Save forecast results (Excel) ---
     save_df = pd.DataFrame({
         "Date": forecast_df.index.strftime("%Y-%m-%d"),
         "Predicted_Revenue": forecast_df.values,
@@ -151,33 +129,20 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
         "Upper_Bound": conf_upper.values
     })
 
-    if os.path.exists(HISTORY_FILE):
-        old = pd.read_excel(HISTORY_FILE)
-        save_df = pd.concat([old, save_df]).drop_duplicates(subset=["Date"], keep="last")
-
     save_df.to_excel(HISTORY_FILE, index=False)
 
     return {
         "next_month_total": float(total_forecast),
         "daily_forecast": forecast_df.to_dict(),
-        "confidence_intervals": {
-            "lower": conf_lower.to_dict(),
-            "upper": conf_upper.to_dict()
-        },
+        "confidence_intervals": {"lower": conf_lower.to_dict(), "upper": conf_upper.to_dict()},
         "saved_to": HISTORY_FILE
     }
 
-# =========================================================
-# ✅ 3. API ENDPOINTS
-# =========================================================
+
 @app.route("/api/revenue/forecast", methods=["GET"])
 def revenue_forecast():
     try:
-        print("⚙️ Starting revenue forecast...")
         result = forecast_next_month()
-        print("✅ Forecast complete!")
-
-        # Convert timestamps for JSON
         daily_forecast_str = {str(d): v for d, v in result["daily_forecast"].items()}
         conf_lower_str = {str(d): v for d, v in result["confidence_intervals"]["lower"].items()}
         conf_upper_str = {str(d): v for d, v in result["confidence_intervals"]["upper"].items()}
@@ -196,59 +161,55 @@ def revenue_forecast():
             }
         })
     except Exception as e:
-        print("❌ Forecast failed:")
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route("/api/revenue/history", methods=["GET"])
 def revenue_history():
-    """Returns saved forecast history"""
     if not os.path.exists(HISTORY_FILE):
         return jsonify({"status": "empty", "message": "No forecast history found yet."})
     df = pd.read_excel(HISTORY_FILE)
-    records = df.to_dict(orient="records")
     return jsonify({
         "status": "success",
         "message": "Forecast history retrieved.",
-        "history": records
+        "history": df.to_dict(orient="records")
     })
 
 
 # =========================================================
-# ✅ 4. SAVE FORECAST ENDPOINT (for Save Button)
+# ✅ NEW: DOWNLOAD FORECAST (Save Button)
 # =========================================================
-@app.route("/api/revenue/save_forecast", methods=["POST"])
-def save_forecast():
-    """Saves forecast summary to JSON file (used by Save button)."""
+@app.route("/api/revenue/download", methods=["GET"])
+def download_forecast():
+    """Generate and send forecast file as Excel."""
     try:
-        data = request.get_json(force=True)
-        if not data or "next_month_total" not in data:
-            return jsonify({"status": "error", "message": "Missing forecast data"}), 400
+        result = forecast_next_month()
+        df = pd.DataFrame({
+            "Date": list(result["daily_forecast"].keys()),
+            "Predicted_Revenue": list(result["daily_forecast"].values()),
+            "Lower_Bound": list(result["confidence_intervals"]["lower"].values()),
+            "Upper_Bound": list(result["confidence_intervals"]["upper"].values())
+        })
 
-        record = {
-            "saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "total": float(data["next_month_total"])
-        }
+        output = io.BytesIO()
+        df.to_excel(output, index=False)
+        output.seek(0)
 
-        # Load existing history or create new
-        if os.path.exists(JSON_HISTORY_FILE):
-            with open(JSON_HISTORY_FILE, "r", encoding="utf-8") as f:
-                history = json.load(f)
-        else:
-            history = []
-
-        history.append(record)
-        with open(JSON_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
-
-        return jsonify({"status": "success", "message": "Forecast saved successfully"})
+        filename = f"RevenueForecast_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return send_file(
+            output,
+            as_attachment=True,
+            download_name=filename,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
     except Exception as e:
+        traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
 # =========================================================
-# ✅ 5. RUN APP
+# ✅ RUN APP
 # =========================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
