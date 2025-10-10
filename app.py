@@ -111,7 +111,7 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
         "confidence_intervals": conf_int.round(2).to_dict()
     }
 
-@app.route("/revenue_forecast", methods=["GET"])
+@app.route("/api/revenue/forecast", methods=["GET"])
 def revenue_forecast():
     try:
         result = forecast_next_month()
@@ -127,9 +127,11 @@ def revenue_forecast():
         }), 500
 
 
+
 # =========================================================
 # ✅ 3. RUN APP
 # =========================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
