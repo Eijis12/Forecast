@@ -71,7 +71,7 @@ def generate_forecast():
         print("=== FORECAST ROUTE TRIGGERED ===")
 
         # Load revenue data
-        df = pd.read_excel(REVENUE_FILE)
+        df = pd.read_excel(DATA_FILE)
         print("Loaded data columns:", list(df.columns))
 
         # Normalize column names
@@ -154,4 +154,5 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
