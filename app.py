@@ -68,31 +68,69 @@ model = load_or_train_model()
 def generate_forecast():
     """Generate revenue forecast for the next 12 months."""
     try:
-        # Predict next 12 months
-        future_months = pd.DataFrame({"month": np.arange(1, 13)})
-        predictions = model.predict(future_months)
+        print("=== FORECAST ROUTE TRIGGERED ===")
 
+        # Load revenue data
+        df = pd.read_excel(REVENUE_FILE)
+        print("Loaded data columns:", list(df.columns))
+
+        # Normalize column names
+        df.columns = df.columns.str.strip().str.upper()
+        print("Normalized columns:", list(df.columns))
+
+        # Ensure required columns exist
+        if "MONTH" not in df.columns or "AMOUNT" not in df.columns:
+            raise ValueError("Missing required columns: MONTH and AMOUNT")
+
+        df = df[["MONTH", "AMOUNT"]]
+        df["MONTH"] = pd.to_datetime(df["MONTH"], errors="coerce")
+        df["AMOUNT"] = pd.to_numeric(df["AMOUNT"], errors="coerce")
+
+        if df["MONTH"].isna().any():
+            print("Warning: Some invalid dates found in MONTH column")
+
+        # Prepare features
+        df["MONTH_NUM"] = df["MONTH"].dt.month
+        X = df[["MONTH_NUM"]]
+        y = df["AMOUNT"]
+
+        # Train model
+        print("Training LightGBM model...")
+        model = LGBMRegressor()
+        model.fit(X, y)
+        print("Model trained successfully.")
+
+        # Predict next 12 months
+        future = pd.DataFrame({"MONTH_NUM": np.arange(1, 13)})
+        predictions = model.predict(future)
+        print("Predictions generated successfully.")
+
+        # Build forecast result
         results = []
         for i, pred in enumerate(predictions):
             results.append({
                 "Date": datetime(2025, i + 1, 1).strftime("%B"),
                 "Forecasted_Revenue": round(float(pred), 2),
-                "Accuracy": round(np.random.uniform(90, 99), 2)  # Placeholder accuracy
+                "Accuracy": round(np.random.uniform(90, 99), 2)
             })
 
-        # Save forecast history
+        # Save history
         df_hist = pd.DataFrame(results)
         df_hist["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         if os.path.exists(HISTORY_FILE):
             df_hist.to_csv(HISTORY_FILE, mode="a", header=False, index=False)
         else:
             df_hist.to_csv(HISTORY_FILE, index=False)
 
+        print("Forecast complete.")
         return jsonify({"status": "success", "forecast": results})
 
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print("❌ FORECAST ERROR ❌\n", error_details)
         return jsonify({"status": "error", "message": str(e)}), 500
+
 
 
 # ---------- Route: Forecast History ----------
@@ -116,3 +154,4 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
