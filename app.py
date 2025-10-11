@@ -9,8 +9,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
 from lightgbm import LGBMRegressor  # ✅ add this line
 
-# Suppress LightGBM feature name warning
-warnings.filterwarnings("ignore", category=UserWarning, module="lightgbm")
 
 app = Flask(__name__)
 CORS(app)
@@ -155,5 +153,6 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
