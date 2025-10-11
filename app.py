@@ -1,4 +1,5 @@
 from flask import Flask, jsonify, send_file
+from flask_cors import CORS
 import pandas as pd
 import numpy as np
 from datetime import timedelta
@@ -6,7 +7,7 @@ from lightgbm import LGBMRegressor
 import os
 
 app = Flask(__name__)
-
+CORS(app)
 # ==========================
 # GLOBAL VARIABLES
 # ==========================
@@ -143,3 +144,4 @@ def download_forecast():
 if __name__ == "__main__":
     load_and_train_model()
     app.run(host="0.0.0.0", port=5000, debug=True)
+
