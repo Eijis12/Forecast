@@ -65,7 +65,7 @@ model = load_or_train_model()
 
 
 # ---------- Route: Generate Forecast ----------
-@app.route("/api/revenue/forecast", methods=["POST"])
+@app.route("/api/revenue/forecast", methods=["GET", "POST"])
 def generate_forecast():
     try:
         # Predict next 12 months
@@ -94,6 +94,7 @@ def generate_forecast():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+
 # ---------- Route: Forecast History ----------
 @app.route("/api/revenue/history", methods=["GET"])
 def get_forecast_history():
@@ -107,3 +108,4 @@ def get_forecast_history():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
