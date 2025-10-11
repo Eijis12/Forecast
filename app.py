@@ -38,47 +38,69 @@ forecast_history = []  # to store previous forecasts
 def home():
     return jsonify({"message": "Dental Forecast ML API is running 🚀"})
 
+from flask import jsonify
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+
 @app.route("/api/revenue/forecast", methods=["GET"])
 def forecast():
-    if model is None:
-        return jsonify({"status": "error", "message": "Model not available"}), 500
-
     try:
+        if model is None:
+            return jsonify({"status": "error", "message": "Model not available"}), 500
+
+        # --- Prepare the dataframe ---
+        df["Date"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]])
+        df = df.sort_values("Date")
+
+        # We'll forecast based on the 'AMOUNT' column
         forecast_days = 30
-        last_row = df.iloc[-1].copy()
-        current_date = last_row['Date']
+        last_date = df["Date"].iloc[-1]
         results = {}
 
         temp_df = df.copy()
+
         for i in range(1, forecast_days + 1):
-            current_date += timedelta(days=1)
+            next_date = last_date + timedelta(days=i)
+
+            # Simple feature simulation for next steps
             next_features = pd.DataFrame({
-                'Patients': [temp_df['Patients'].iloc[-1] * np.random.uniform(0.95, 1.05)],
-                'Treatments': [temp_df['Treatments'].iloc[-1] * np.random.uniform(0.95, 1.05)],
-                'Expenses': [temp_df['Expenses'].iloc[-1] * np.random.uniform(0.95, 1.05)],
+                "YEAR": [next_date.year],
+                "MONTH": [next_date.month],
+                "DAY": [next_date.day],
+                # Optionally you can include previous AMOUNT as feature
+                "AMOUNT": [temp_df["AMOUNT"].iloc[-1] * np.random.uniform(0.95, 1.05)]
             })
 
+            # Align features to what your LightGBM model expects
+            next_features = next_features.reindex(columns=model.feature_name_, fill_value=0)
+
             predicted = model.predict(next_features)[0]
-            results[current_date.strftime("%Y-%m-%d")] = round(float(predicted), 2)
+            results[next_date.strftime("%Y-%m-%d")] = round(float(predicted), 2)
 
-            # Append simulated row for recursive forecasting
-            next_row = {
-                'Date': current_date,
-                'Patients': next_features['Patients'].iloc[0],
-                'Treatments': next_features['Treatments'].iloc[0],
-                'Expenses': next_features['Expenses'].iloc[0],
-                'Revenue': predicted
-            }
-            temp_df = pd.concat([temp_df, pd.DataFrame([next_row])], ignore_index=True)
+            # Append this to temp_df for recursive forecasting
+            temp_df = pd.concat([
+                temp_df,
+                pd.DataFrame([{
+                    "YEAR": next_date.year,
+                    "MONTH": next_date.month,
+                    "DAY": next_date.day,
+                    "NAMES": "",
+                    "TREATMENT": "",
+                    "PAYMENT METHOD": "",
+                    "AMOUNT": predicted
+                }])
+            ], ignore_index=True)
 
-        # Save for history
         forecast_df = pd.DataFrame({
-            'Date': list(results.keys()),
-            'Forecasted_Revenue': list(results.values())
+            "Date": list(results.keys()),
+            "Forecasted_Revenue": list(results.values())
         })
-        forecast_df['Accuracy'] = np.random.randint(90, 100, size=len(forecast_df))  # placeholder accuracy
+
+        # Placeholder accuracy
+        forecast_df["Accuracy"] = np.random.randint(90, 100, size=len(forecast_df))
         forecast_history.clear()
-        forecast_history.extend(forecast_df.to_dict(orient='records'))
+        forecast_history.extend(forecast_df.to_dict(orient="records"))
 
         return jsonify({
             "status": "success",
@@ -88,6 +110,8 @@ def forecast():
         })
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -116,3 +140,4 @@ def download_forecast():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
