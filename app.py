@@ -5,9 +5,11 @@ import numpy as np
 import os
 import datetime
 import traceback
+import joblib
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
-from lightgbm import LGBMRegressor  # ✅ add this line
+import lightgbm as lgb                     # ✅ Added full LightGBM import
+from lightgbm import LGBMRegressor         # ✅ For direct use
 
 
 app = Flask(__name__)
@@ -51,7 +53,7 @@ def load_or_train_model():
     # Train model
     X = df[["month"]]
     y = df["amount"]
-    model = lgb.LGBMRegressor()
+    model = LGBMRegressor()                # ✅ Fixed: removed lgb. prefix
     model.fit(X, y)
 
     joblib.dump(model, MODEL_FILE)
@@ -95,7 +97,7 @@ def generate_forecast():
 
         # Train model
         print("Training LightGBM model...")
-        model = LGBMRegressor()
+        model = LGBMRegressor()            # ✅ Fixed: consistent call
         model.fit(X, y)
         print("Model trained successfully.")
 
@@ -108,14 +110,14 @@ def generate_forecast():
         results = []
         for i, pred in enumerate(predictions):
             results.append({
-                "Date": datetime(2025, i + 1, 1).strftime("%B"),
+                "Date": datetime.datetime(2025, i + 1, 1).strftime("%B"),
                 "Forecasted_Revenue": round(float(pred), 2),
                 "Accuracy": round(np.random.uniform(90, 99), 2)
             })
 
         # Save history
         df_hist = pd.DataFrame(results)
-        df_hist["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        df_hist["timestamp"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if os.path.exists(HISTORY_FILE):
             df_hist.to_csv(HISTORY_FILE, mode="a", header=False, index=False)
         else:
@@ -125,7 +127,6 @@ def generate_forecast():
         return jsonify({"status": "success", "forecast": results})
 
     except Exception as e:
-        import traceback
         error_details = traceback.format_exc()
         print("❌ FORECAST ERROR ❌\n", error_details)
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -153,6 +154,3 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-
-
