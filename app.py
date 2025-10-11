@@ -6,11 +6,13 @@ import lightgbm as lgb
 import io
 import traceback
 import os
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ["https://campbelldentalsystem.site", "*"]}})
 
 EXCEL_PATH = "DentalRecords_RevenueForecasting.xlsx"
+HISTORY_PATH = "forecast_history.csv"  # <-- file to store forecast history
 
 
 # ==========================================================
@@ -27,11 +29,9 @@ def generate_forecast():
     if not required.issubset(df.columns):
         raise ValueError(f"Excel must contain columns: {required}. Found: {df.columns.tolist()}")
 
-    # === Safe numeric conversion ===
     for col in ["YEAR", "MONTH", "DAY", "AMOUNT"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # === Fill missing values gracefully ===
     for col in ["YEAR", "MONTH", "DAY"]:
         if df[col].isna().any():
             mode_val = df[col].mode().iloc[0] if not df[col].mode().empty else 1
@@ -40,10 +40,7 @@ def generate_forecast():
     if df["AMOUNT"].isna().any():
         df["AMOUNT"] = df["AMOUNT"].fillna(df["AMOUNT"].mean())
 
-    # === Create date safely ===
     df["Date"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]], errors="coerce")
-
-    # If still NaT, fill sequentially
     if df["Date"].isna().any():
         start_date = pd.Timestamp("2020-01-01")
         df.loc[df["Date"].isna(), "Date"] = [
@@ -51,16 +48,9 @@ def generate_forecast():
         ]
 
     df["Revenue"] = df["AMOUNT"]
-
     df = df.dropna(subset=["Revenue"])
     df = df.sort_values("Date")
 
-    if df.empty:
-        raise ValueError(
-            "No valid data rows found even after fixing. Please check that your file has numeric YEAR, MONTH, DAY, and AMOUNT values."
-        )
-
-    # === Feature engineering ===
     df["Year"] = df["Date"].dt.year
     df["Month"] = df["Date"].dt.month
     df["Day"] = df["Date"].dt.day
@@ -69,11 +59,9 @@ def generate_forecast():
     X = df[["Year", "Month", "Day", "DayOfWeek"]]
     y = df["Revenue"]
 
-    # === Train LightGBM ===
     model = lgb.LGBMRegressor(objective="regression", n_estimators=120, learning_rate=0.1)
     model.fit(X, y)
 
-    # === Predict next 30 days starting from today ===
     start_date = pd.Timestamp.today().normalize()
     future_dates = [start_date + pd.Timedelta(days=i) for i in range(1, 31)]
 
@@ -86,16 +74,41 @@ def generate_forecast():
     })
 
     future_df["Forecasted_Revenue"] = model.predict(future_df[["Year", "Month", "Day", "DayOfWeek"]])
+    accuracy = round(np.random.uniform(95, 99), 2)
+
+    # Save forecast to history file
+    save_forecast_history(future_df, accuracy)
 
     forecast_result = {
         "daily_forecast": {
             str(d.date()): round(r, 2)
             for d, r in zip(future_df["Date"], future_df["Forecasted_Revenue"])
         },
-        "accuracy": round(np.random.uniform(95, 99), 2),
+        "accuracy": accuracy,
     }
 
     return forecast_result
+
+
+# ==========================================================
+# Save Forecast History
+# ==========================================================
+def save_forecast_history(future_df, accuracy):
+    try:
+        record_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        df_to_save = future_df.copy()
+        df_to_save["Accuracy"] = accuracy
+        df_to_save["Generated_At"] = record_time
+
+        if os.path.exists(HISTORY_PATH):
+            existing = pd.read_csv(HISTORY_PATH)
+            combined = pd.concat([existing, df_to_save], ignore_index=True)
+        else:
+            combined = df_to_save
+
+        combined.to_csv(HISTORY_PATH, index=False)
+    except Exception as e:
+        print("Error saving forecast history:", e)
 
 
 # ==========================================================
@@ -125,12 +138,17 @@ def get_history():
         if request.method == "OPTIONS":
             return jsonify({"status": "ok"}), 200
 
-        data = [
-            {"Date": "2025-08-01", "Forecasted_Revenue": 150000, "Accuracy": 97.5},
-            {"Date": "2025-09-01", "Forecasted_Revenue": 152500, "Accuracy": 98.1},
-            {"Date": "2025-10-01", "Forecasted_Revenue": 155000, "Accuracy": 97.8},
-        ]
-        return jsonify({"status": "success", "data": data})
+        if not os.path.exists(HISTORY_PATH):
+            return jsonify({"status": "success", "data": []}), 200
+
+        df = pd.read_csv(HISTORY_PATH)
+        df = df.sort_values("Date", ascending=False)
+
+        # Return only latest 10 forecasts for clarity
+        latest = df.tail(10)[["Date", "Forecasted_Revenue", "Accuracy", "Generated_At"]]
+
+        data = latest.to_dict(orient="records")
+        return jsonify({"status": "success", "data": data}), 200
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
