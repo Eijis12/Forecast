@@ -5,10 +5,10 @@ import numpy as np
 import os
 import io
 import datetime
+import random
 import traceback
 import joblib
-import random
-from lightgbm import LGBMRegressor
+import lightgbm as lgb
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -32,21 +32,20 @@ def load_or_train_model():
     df = pd.read_excel(DATA_FILE)
     df.columns = [col.strip().lower() for col in df.columns]
 
-    # Validate columns
     if "month" not in df.columns or "amount" not in df.columns:
         raise ValueError(f"Missing required columns. Found: {', '.join(df.columns)}")
 
-    # Convert month text to numeric month number
     df["month_num"] = pd.to_datetime(df["month"], errors="coerce", format="%B").dt.month
     if df["month_num"].isna().any():
         df["month_num"] = pd.to_datetime(df["month"], errors="coerce", format="%b").dt.month
+
     df = df.dropna(subset=["month_num"])
     df["month_num"] = df["month_num"].astype(int)
 
     X = df[["month_num"]]
     y = df["amount"]
 
-    model = LGBMRegressor()
+    model = lgb.LGBMRegressor()
     model.fit(X, y)
     joblib.dump(model, MODEL_FILE)
     print("✅ Trained and saved new model.")
@@ -61,23 +60,27 @@ model = load_or_train_model()
 @app.route('/api/revenue/forecast', methods=['POST'])
 def generate_forecast():
     try:
-        df = pd.read_excel(DATA_FILE)
-        df.columns = [col.strip().upper() for col in df.columns]
+        if not os.path.exists(DATA_FILE):
+            return jsonify({"status": "error", "message": "Data file not found."}), 404
 
-        # Verify column names
-        if 'DATE' not in df.columns or 'AMOUNT' not in df.columns:
-            return jsonify({"status": "error", "message": "Missing 'DATE' or 'AMOUNT' column"}), 400
+        df = pd.read_excel(DATA_FILE)
+
+        if 'AMOUNT' not in df.columns or 'DATE' not in df.columns:
+            return jsonify({"status": "error", "message": "Missing 'AMOUNT' or 'DATE' column"}), 400
 
         df['DATE'] = pd.to_datetime(df['DATE'])
-        df = df.sort_values('DATE')
+        daily_revenue = df.groupby('DATE')['AMOUNT'].sum().reset_index()
+        daily_revenue = daily_revenue.sort_values('DATE')
 
-        df['DayOfYear'] = df['DATE'].dt.dayofyear
-        X = df[['DayOfYear']]
-        y = df['AMOUNT']
+        # --- Train model ---
+        daily_revenue['DayOfYear'] = daily_revenue['DATE'].dt.dayofyear
+        X = daily_revenue[['DayOfYear']]
+        y = daily_revenue['AMOUNT']
 
-        model = LGBMRegressor()
+        model = lgb.LGBMRegressor()
         model.fit(X, y)
 
+        # --- Forecast next 30 days ---
         today = datetime.date.today()
         next_30_days = pd.date_range(today, periods=30, freq='D')
         forecast_input = pd.DataFrame({'DayOfYear': next_30_days.dayofyear})
@@ -85,19 +88,12 @@ def generate_forecast():
 
         forecast_df = pd.DataFrame({
             "Date": next_30_days.strftime("%Y-%m-%d"),
-            "Forecasted_Revenue": [round(float(v), 2) for v in forecast_values],
+            "Forecasted_Revenue": np.round(forecast_values, 2),
             "Accuracy": [round(random.uniform(92, 99), 2)] * 30
         })
 
-        # Save forecast to history CSV
-        if os.path.exists(HISTORY_FILE):
-            existing = pd.read_csv(HISTORY_FILE)
-            updated = pd.concat([existing, forecast_df], ignore_index=True)
-        else:
-            updated = forecast_df
-        updated.to_csv(HISTORY_FILE, index=False)
-
-        # Save to Excel for download
+        # --- Save forecast results ---
+        forecast_df.to_csv(HISTORY_FILE, index=False)
         forecast_df.to_excel("forecast_results.xlsx", index=False)
 
         return jsonify({
@@ -106,8 +102,7 @@ def generate_forecast():
         })
 
     except Exception as e:
-        print("❌ Error generating forecast:", e)
-        traceback.print_exc()
+        print("❌ Error generating forecast:", traceback.format_exc())
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -128,16 +123,12 @@ def get_forecast_history():
 @app.route("/api/revenue/download", methods=["GET"])
 def download_forecast():
     try:
-        if not os.path.exists(HISTORY_FILE):
-            return jsonify({"status": "error", "message": "No forecast data available"}), 404
+        if not os.path.exists("forecast_results.xlsx"):
+            return jsonify({"status": "error", "message": "No forecast file found"}), 404
 
-        df = pd.read_csv(HISTORY_FILE)
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False, sheet_name="Forecast")
-        output.seek(0)
-        return send_file(output, download_name="forecast_results.xlsx", as_attachment=True)
+        return send_file("forecast_results.xlsx", as_attachment=True)
     except Exception as e:
+        print("❌ Download error:", e)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
