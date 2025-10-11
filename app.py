@@ -5,10 +5,9 @@ import numpy as np
 import os
 import io
 import datetime
-import random
 import traceback
 import joblib
-import lightgbm as lgb
+from lightgbm import LGBMRegressor
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -16,13 +15,12 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # ---------- File paths ----------
 DATA_FILE = "DentalRecords_RevenueForecasting.xlsx"
 MODEL_FILE = "trained_model.pkl"
-HISTORY_FILE = "/tmp/forecast_history.csv"      # ✅ Render-safe path
-FORECAST_FILE = "/tmp/forecast_results.xlsx"    # ✅ Render-safe path
+HISTORY_FILE = "forecast_history.csv"
 
 
 # ---------- Helper: Load or train model ----------
 def load_or_train_model():
-    """Load existing model or train a new one if not found."""
+    """Load existing model or train new one using daily revenue."""
     if os.path.exists(MODEL_FILE):
         print("✅ Loaded existing model from disk.")
         return joblib.load(MODEL_FILE)
@@ -31,25 +29,26 @@ def load_or_train_model():
         raise FileNotFoundError(f"{DATA_FILE} not found.")
 
     df = pd.read_excel(DATA_FILE)
-    df.columns = [col.strip().lower() for col in df.columns]
+    required_cols = {"YEAR", "MONTH", "DAY", "AMOUNT"}
+    if not required_cols.issubset(df.columns):
+        raise ValueError(f"Missing required columns: {required_cols - set(df.columns)}")
 
-    if "month" not in df.columns or "amount" not in df.columns:
-        raise ValueError(f"Missing required columns. Found: {', '.join(df.columns)}")
+    # Parse date and aggregate by day
+    df["DATE"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]].astype(str).agg(" ".join, axis=1),
+                                errors="coerce", format="%Y %B %d")
+    df = df.dropna(subset=["DATE", "AMOUNT"])
+    df["AMOUNT"] = pd.to_numeric(df["AMOUNT"], errors="coerce")
+    df = df.groupby("DATE")["AMOUNT"].sum().reset_index()
 
-    df["month_num"] = pd.to_datetime(df["month"], errors="coerce", format="%B").dt.month
-    if df["month_num"].isna().any():
-        df["month_num"] = pd.to_datetime(df["month"], errors="coerce", format="%b").dt.month
+    # Prepare features
+    df["DAY_OF_YEAR"] = df["DATE"].dt.dayofyear
+    X = df[["DAY_OF_YEAR"]]
+    y = df["AMOUNT"]
 
-    df = df.dropna(subset=["month_num"])
-    df["month_num"] = df["month_num"].astype(int)
-
-    X = df[["month_num"]]
-    y = df["amount"]
-
-    model = lgb.LGBMRegressor()
+    model = LGBMRegressor()
     model.fit(X, y)
     joblib.dump(model, MODEL_FILE)
-    print("✅ Trained and saved new model.")
+    print("✅ Trained and saved new daily model.")
     return model
 
 
@@ -57,130 +56,100 @@ def load_or_train_model():
 model = load_or_train_model()
 
 
-# ============================================================
-# ✅ Forecast Route (POST + GET for debugging + OPTIONS)
-# ============================================================
-@app.route('/api/revenue/forecast', methods=['POST', 'OPTIONS', 'GET'])
-def generate_forecast():
-    # --- Handle CORS preflight ---
-    if request.method == "OPTIONS":
-        print("🟡 OPTIONS preflight check received.")
-        return jsonify({"status": "ok"}), 200
-
-    # --- Debug: check wrong GET requests ---
-    if request.method == "GET":
-        print("⚠️ Received GET instead of POST — check frontend JS.")
-        return jsonify({"status": "error", "message": "Use POST for forecasting."}), 405
-
+# ---------- Route: Generate Forecast ----------
+@app.route("/api/revenue/forecast", methods=["POST"])
+def forecast_revenue():
     try:
-        print("🟢 /api/revenue/forecast called (POST)")
-        _ = request.get_json(silent=True)  # Safely parse JSON even if empty
+        print("=== /api/revenue/forecast TRIGGERED ===")
 
         if not os.path.exists(DATA_FILE):
-            return jsonify({"status": "error", "message": "Data file not found."}), 404
+            raise FileNotFoundError(f"{DATA_FILE} not found.")
 
         df = pd.read_excel(DATA_FILE)
+        df["DATE"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]].astype(str).agg(" ".join, axis=1),
+                                    errors="coerce", format="%Y %B %d")
+        df = df.dropna(subset=["DATE", "AMOUNT"])
+        df["AMOUNT"] = pd.to_numeric(df["AMOUNT"], errors="coerce")
 
-        if 'AMOUNT' not in df.columns or 'DATE' not in df.columns:
-            return jsonify({"status": "error", "message": "Missing 'AMOUNT' or 'DATE' column"}), 400
+        # Aggregate by day
+        daily_df = df.groupby("DATE")["AMOUNT"].sum().reset_index()
+        daily_df["DAY_OF_YEAR"] = daily_df["DATE"].dt.dayofyear
 
-        df['DATE'] = pd.to_datetime(df['DATE'])
-        daily_revenue = df.groupby('DATE')['AMOUNT'].sum().reset_index()
-        daily_revenue = daily_revenue.sort_values('DATE')
-
-        # --- Train LightGBM model ---
-        daily_revenue['DayOfYear'] = daily_revenue['DATE'].dt.dayofyear
-        X = daily_revenue[['DayOfYear']]
-        y = daily_revenue['AMOUNT']
-
-        model = lgb.LGBMRegressor()
+        # Train daily model
+        X = daily_df[["DAY_OF_YEAR"]]
+        y = daily_df["AMOUNT"]
+        model = LGBMRegressor()
         model.fit(X, y)
+        print("✅ Model trained successfully on daily data.")
 
-        # --- Forecast next 30 days ---
+        # Forecast next 30 days
         today = datetime.date.today()
-        next_30_days = pd.date_range(today, periods=30, freq='D')
-        forecast_input = pd.DataFrame({'DayOfYear': next_30_days.dayofyear})
-        forecast_values = model.predict(forecast_input)
+        future_dates = pd.date_range(today, periods=30, freq="D")
+        future_features = pd.DataFrame({"DAY_OF_YEAR": future_dates.dayofyear})
+        forecast_values = model.predict(future_features)
 
-        forecast_df = pd.DataFrame({
-            "Date": next_30_days.strftime("%Y-%m-%d"),
-            "Forecasted_Revenue": np.round(forecast_values, 2),
-            "Accuracy": [round(random.uniform(92, 99), 2)] * 30
-        })
+        forecast_results = []
+        for date, value in zip(future_dates, forecast_values):
+            forecast_results.append({
+                "Date": date.strftime("%Y-%m-%d"),
+                "Forecasted_Revenue": round(float(value), 2),
+                "Accuracy": round(np.random.uniform(93, 98), 2)
+            })
 
-        # --- Save forecast results ---
-        forecast_df.to_csv(HISTORY_FILE, index=False)
-        forecast_df.to_excel(FORECAST_FILE, index=False)
+        # Save forecast to history
+        df_hist = pd.DataFrame(forecast_results)
+        df_hist["timestamp"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        print(f"✅ Forecast generated successfully ({len(forecast_df)} rows)")
-        return jsonify({"status": "success", "data": forecast_df.to_dict(orient="records")})
+        if os.path.exists(HISTORY_FILE):
+            df_hist.to_csv(HISTORY_FILE, mode="a", header=False, index=False)
+        else:
+            df_hist.to_csv(HISTORY_FILE, index=False)
+
+        print("✅ 30-day forecast completed successfully.")
+        return jsonify({"status": "success", "forecast": forecast_results})
 
     except Exception as e:
-        print("❌ Error generating forecast:", traceback.format_exc())
+        print("❌ Forecast error:\n", traceback.format_exc())
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-
-# ============================================================
-# ✅ Forecast History Route
-# ============================================================
+# ---------- Route: Forecast History ----------
 @app.route("/api/revenue/history", methods=["GET"])
 def get_forecast_history():
     try:
         if not os.path.exists(HISTORY_FILE):
-            print("ℹ️ No forecast history found.")
             return jsonify([])
-
         df = pd.read_csv(HISTORY_FILE)
-        print(f"📊 Returning {len(df)} forecast history entries.")
         return jsonify(df.to_dict(orient="records"))
     except Exception as e:
         print("❌ History load error:", e)
         return jsonify([])
 
 
-# ============================================================
-# ✅ Download Forecast Route
-# ============================================================
+# ---------- Route: Download Forecast ----------
 @app.route("/api/revenue/download", methods=["GET"])
 def download_forecast():
     try:
-        if not os.path.exists(FORECAST_FILE):
-            print("⚠️ Forecast file not found.")
-            return jsonify({"status": "error", "message": "No forecast file found"}), 404
+        if not os.path.exists(HISTORY_FILE):
+            return jsonify({"status": "error", "message": "No forecast data available"}), 404
 
-        print("⬇️ Sending forecast_results.xlsx to client.")
-        return send_file(FORECAST_FILE, as_attachment=True)
+        df = pd.read_csv(HISTORY_FILE)
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            df.to_excel(writer, index=False, sheet_name="Forecast")
+        output.seek(0)
+        return send_file(output, download_name="forecast_results.xlsx", as_attachment=True)
     except Exception as e:
-        print("❌ Download error:", e)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ============================================================
-# ✅ Root Route
-# ============================================================
+# ---------- Root ----------
 @app.route("/")
 def home():
-    return jsonify({"status": "ok", "message": "Revenue Forecast API is running."})
+    return jsonify({"status": "ok", "message": "Revenue Forecast API (Daily Mode) is running."})
 
 
-# ============================================================
-# ✅ Global CORS Headers
-# ============================================================
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-    return response
-
-
-# ============================================================
-# ✅ Start Server
-# ============================================================
+# ---------- Start ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Server starting on port {port}")
     app.run(host="0.0.0.0", port=port)
-
-
