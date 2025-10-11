@@ -65,42 +65,54 @@ def generate_forecast():
     try:
         print("=== FORECAST ROUTE TRIGGERED ===")
 
+        # --- Load and validate data ---
         if not os.path.exists(DATA_FILE):
             raise FileNotFoundError(f"{DATA_FILE} not found.")
 
         df = pd.read_excel(DATA_FILE)
         print("Loaded data columns:", list(df.columns))
 
+        # Normalize column names
         df.columns = df.columns.str.strip().str.upper()
-        print("Normalized columns:", list(df.columns))
 
         if "MONTH" not in df.columns or "AMOUNT" not in df.columns:
             raise ValueError("Missing required columns: MONTH and AMOUNT")
 
         df = df[["MONTH", "AMOUNT"]]
-        df["MONTH"] = pd.to_datetime(df["MONTH"], errors="coerce")
+
+        # --- Convert MONTH to month number robustly ---
+        month_map = {
+            "JANUARY": 1, "FEBRUARY": 2, "MARCH": 3, "APRIL": 4, "MAY": 5, "JUNE": 6,
+            "JULY": 7, "AUGUST": 8, "SEPTEMBER": 9, "OCTOBER": 10, "NOVEMBER": 11, "DECEMBER": 12
+        }
+
+        # Handle both text and datetime
+        def convert_month(val):
+            if isinstance(val, (int, float)) and 1 <= val <= 12:
+                return int(val)
+            val_str = str(val).strip().upper()
+            return month_map.get(val_str[:3] + "UARY" if val_str in ["JAN", "FEB", "MAR"] else month_map.get(val_str, np.nan))
+
+        df["MONTH_NUM"] = df["MONTH"].apply(lambda x: month_map.get(str(x).strip().upper(), np.nan))
         df["AMOUNT"] = pd.to_numeric(df["AMOUNT"], errors="coerce")
+        df = df.dropna(subset=["MONTH_NUM", "AMOUNT"])
 
-        if df["MONTH"].isna().any():
-            print("⚠️ Warning: Some invalid dates found in MONTH column")
+        if df.empty:
+            raise ValueError("No valid MONTH or AMOUNT data found after cleaning.")
 
-        # Prepare data
-        df["MONTH_NUM"] = df["MONTH"].dt.month
+        # --- Train LightGBM ---
         X = df[["MONTH_NUM"]]
         y = df["AMOUNT"]
 
-        # Train a new LightGBM model
-        print("Training LightGBM model...")
+        print(f"Training on {len(df)} records...")
         model = LGBMRegressor()
         model.fit(X, y)
         print("✅ Model trained successfully.")
 
-        # Predict next 12 months
+        # --- Predict next 12 months ---
         future = pd.DataFrame({"MONTH_NUM": np.arange(1, 13)})
         predictions = model.predict(future)
-        print("✅ Predictions generated successfully.")
 
-        # Build forecast result
         results = []
         for i, pred in enumerate(predictions):
             results.append({
@@ -109,23 +121,23 @@ def generate_forecast():
                 "Accuracy": round(np.random.uniform(90, 99), 2)
             })
 
-        print("DEBUG RETURN:", results)
+        print("✅ Forecast results generated:", results[:3], "...")
 
-        # Save history
+        # --- Save to history ---
         df_hist = pd.DataFrame(results)
         df_hist["timestamp"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
         if os.path.exists(HISTORY_FILE):
             df_hist.to_csv(HISTORY_FILE, mode="a", header=False, index=False)
         else:
             df_hist.to_csv(HISTORY_FILE, index=False)
 
-        print("✅ Forecast complete.")
         return jsonify({"status": "success", "forecast": results})
 
     except Exception as e:
-        error_details = traceback.format_exc()
-        print("❌ FORECAST ERROR ❌\n", error_details)
+        print("❌ FORECAST ERROR ❌\n", traceback.format_exc())
         return jsonify({"status": "error", "message": str(e)}), 500
+
 
 
 # ---------- Route: Forecast History ----------
@@ -164,3 +176,4 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
