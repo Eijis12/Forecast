@@ -1,12 +1,13 @@
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import pandas as pd
-import lightgbm as lgb
 import numpy as np
-import joblib
 import os
-from datetime import datetime
-import warnings
+import datetime
+import traceback
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error
+from lightgbm import LGBMRegressor  # ✅ add this line
 
 # Suppress LightGBM feature name warning
 warnings.filterwarnings("ignore", category=UserWarning, module="lightgbm")
