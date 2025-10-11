@@ -3,19 +3,16 @@ from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import os
+import io
 import datetime
 import traceback
 import joblib
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error
-import lightgbm as lgb                     # ✅ Added full LightGBM import
-from lightgbm import LGBMRegressor         # ✅ For direct use
-
+from lightgbm import LGBMRegressor
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})  # ✅ Allow all origins
 
-# File paths
+# ---------- File paths ----------
 DATA_FILE = "DentalRecords_RevenueForecasting.xlsx"
 MODEL_FILE = "trained_model.pkl"
 HISTORY_FILE = "forecast_history.csv"
@@ -25,6 +22,7 @@ HISTORY_FILE = "forecast_history.csv"
 def load_or_train_model():
     """Load trained model or train a new one from Excel."""
     if os.path.exists(MODEL_FILE):
+        print("✅ Loaded existing model from disk.")
         return joblib.load(MODEL_FILE)
 
     if not os.path.exists(DATA_FILE):
@@ -32,15 +30,10 @@ def load_or_train_model():
 
     # Load Excel data
     df = pd.read_excel(DATA_FILE)
-
-    # Normalize column names
     df.columns = [col.strip().lower() for col in df.columns]
 
-    # Validate columns
-    if "month" not in df.columns:
-        raise ValueError(f"Missing 'MONTH' column. Found: {', '.join(df.columns)}")
-    if "amount" not in df.columns:
-        raise ValueError(f"Missing 'AMOUNT' column. Found: {', '.join(df.columns)}")
+    if "month" not in df.columns or "amount" not in df.columns:
+        raise ValueError(f"Missing required columns. Found: {', '.join(df.columns)}")
 
     # Convert month names to numeric
     df["month"] = pd.to_datetime(df["month"], errors="coerce", format="%B").dt.month
@@ -50,17 +43,18 @@ def load_or_train_model():
     df = df.dropna(subset=["month"])
     df["month"] = df["month"].astype(int)
 
-    # Train model
     X = df[["month"]]
     y = df["amount"]
-    model = LGBMRegressor()                # ✅ Fixed: removed lgb. prefix
+
+    model = LGBMRegressor()
     model.fit(X, y)
 
     joblib.dump(model, MODEL_FILE)
+    print("✅ Trained and saved new model.")
     return model
 
 
-# Load or train model at startup
+# Load model on startup
 model = load_or_train_model()
 
 
@@ -71,15 +65,15 @@ def generate_forecast():
     try:
         print("=== FORECAST ROUTE TRIGGERED ===")
 
-        # Load revenue data
+        if not os.path.exists(DATA_FILE):
+            raise FileNotFoundError(f"{DATA_FILE} not found.")
+
         df = pd.read_excel(DATA_FILE)
         print("Loaded data columns:", list(df.columns))
 
-        # Normalize column names
         df.columns = df.columns.str.strip().str.upper()
         print("Normalized columns:", list(df.columns))
 
-        # Ensure required columns exist
         if "MONTH" not in df.columns or "AMOUNT" not in df.columns:
             raise ValueError("Missing required columns: MONTH and AMOUNT")
 
@@ -88,23 +82,23 @@ def generate_forecast():
         df["AMOUNT"] = pd.to_numeric(df["AMOUNT"], errors="coerce")
 
         if df["MONTH"].isna().any():
-            print("Warning: Some invalid dates found in MONTH column")
+            print("⚠️ Warning: Some invalid dates found in MONTH column")
 
-        # Prepare features
+        # Prepare data
         df["MONTH_NUM"] = df["MONTH"].dt.month
         X = df[["MONTH_NUM"]]
         y = df["AMOUNT"]
 
-        # Train model
+        # Train a new LightGBM model
         print("Training LightGBM model...")
-        model = LGBMRegressor()            # ✅ Fixed: consistent call
+        model = LGBMRegressor()
         model.fit(X, y)
-        print("Model trained successfully.")
+        print("✅ Model trained successfully.")
 
         # Predict next 12 months
         future = pd.DataFrame({"MONTH_NUM": np.arange(1, 13)})
         predictions = model.predict(future)
-        print("Predictions generated successfully.")
+        print("✅ Predictions generated successfully.")
 
         # Build forecast result
         results = []
@@ -115,6 +109,8 @@ def generate_forecast():
                 "Accuracy": round(np.random.uniform(90, 99), 2)
             })
 
+        print("DEBUG RETURN:", results)
+
         # Save history
         df_hist = pd.DataFrame(results)
         df_hist["timestamp"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -123,14 +119,13 @@ def generate_forecast():
         else:
             df_hist.to_csv(HISTORY_FILE, index=False)
 
-        print("Forecast complete.")
+        print("✅ Forecast complete.")
         return jsonify({"status": "success", "forecast": results})
 
     except Exception as e:
         error_details = traceback.format_exc()
         print("❌ FORECAST ERROR ❌\n", error_details)
         return jsonify({"status": "error", "message": str(e)}), 500
-
 
 
 # ---------- Route: Forecast History ----------
@@ -144,7 +139,22 @@ def get_forecast_history():
     return jsonify(df.to_dict(orient="records"))
 
 
-# ---------- Route: Root (for Render health checks) ----------
+# ---------- Route: Download Forecast ----------
+@app.route("/api/revenue/download", methods=["GET"])
+def download_forecast():
+    """Download the forecast history as an Excel file."""
+    if not os.path.exists(HISTORY_FILE):
+        return jsonify({"status": "error", "message": "No forecast data available"}), 404
+
+    df = pd.read_csv(HISTORY_FILE)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Forecast")
+    output.seek(0)
+    return send_file(output, download_name="forecast_results.xlsx", as_attachment=True)
+
+
+# ---------- Root Route ----------
 @app.route("/")
 def home():
     return jsonify({"status": "ok", "message": "Revenue Forecast API is running."})
