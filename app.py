@@ -1,55 +1,49 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, jsonify, send_file
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
-import pickle
-import traceback
-import logging
-import sys
+from datetime import timedelta
+import lightgbm as lgb
 import os
-from datetime import datetime
 
-# ===========================
-# 🔧 Logging setup
-# ===========================
-logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-
-# ===========================
-# 🔧 Flask app
-# ===========================
 app = Flask(__name__)
 CORS(app)
 
-# ===========================
-# 🔧 Load ML model (optional)
-# ===========================
-MODEL_PATH = "revenue_model.pkl"
-model = None
+# ===============================
+# Load Dataset and Train Model
+# ===============================
+try:
+    df = pd.read_csv("revenue_data.csv")  # your dataset
+    df['Date'] = pd.to_datetime(df[['YEAR', 'MONTH', 'DAY']])
 
-if os.path.exists(MODEL_PATH):
-    try:
-        with open(MODEL_PATH, "rb") as f:
-            model = pickle.load(f)
-        logger.info("✅ Revenue model loaded successfully.")
-    except Exception as e:
-        logger.error(f"⚠️ Failed to load model: {e}")
-else:
-    logger.warning("⚠️ No model file found — using dummy forecast.")
+    # Aggregate daily revenue (sum of AMOUNT)
+    daily_revenue = df.groupby('Date')['AMOUNT'].sum().reset_index()
+    daily_revenue['DayOfWeek'] = daily_revenue['Date'].dt.dayofweek
+    daily_revenue['Month'] = daily_revenue['Date'].dt.month
 
-# ===========================
-# 🔹 Dummy forecast function
-# ===========================
-def generate_dummy_forecast():
-    """Fallback if model not available."""
-    today = datetime.today()
-    days = pd.date_range(today, periods=7).strftime("%Y-%m-%d").tolist()
-    revenue = np.random.randint(500, 5000, size=7).tolist()
-    return list(zip(days, revenue))
+    # Features and target
+    X = daily_revenue[['DayOfWeek', 'Month']]
+    y = daily_revenue['AMOUNT']
 
-# ===========================
-# 🔹 Forecast API
-# ===========================
+    # Train LightGBM model
+    model = lgb.LGBMRegressor()
+    model.fit(X, y)
+
+    print("✅ LightGBM model trained successfully.")
+except Exception as e:
+    print(f"⚠️ Model training failed: {e}")
+    model = None
+
+# ===============================
+# Routes
+# ===============================
+
+@app.route("/")
+def home():
+    return jsonify({"status": "ok", "message": "Forecast API is running."})
+
+
+# ---------- FORECAST ----------
 @app.route("/api/revenue/forecast", methods=["GET"])
 def forecast():
     if model is None:
@@ -57,30 +51,36 @@ def forecast():
 
     try:
         forecast_days = 30
-        last_row = df.iloc[-1].copy()
-        current_date = pd.Timestamp(year=last_row["YEAR"], month=last_row["MONTH"], day=last_row["DAY"])
+        last_date = df[['YEAR', 'MONTH', 'DAY']].iloc[-1]
+        current_date = pd.Timestamp(year=int(last_date['YEAR']),
+                                    month=int(last_date['MONTH']),
+                                    day=int(last_date['DAY']))
+
         results = {}
 
+        # Use the last known month/day pattern
         temp_df = df.copy()
-        for i in range(1, forecast_days + 1):
+        for _ in range(forecast_days):
             current_date += timedelta(days=1)
-            next_features = pd.DataFrame({
-                'Patients': [temp_df['Patients'].iloc[-1] * np.random.uniform(0.95, 1.05) if 'Patients' in temp_df.columns else np.random.uniform(10, 30)],
-                'Treatments': [temp_df['Treatments'].iloc[-1] * np.random.uniform(0.95, 1.05) if 'Treatments' in temp_df.columns else np.random.uniform(5, 15)],
-                'Expenses': [temp_df['Expenses'].iloc[-1] * np.random.uniform(0.95, 1.05) if 'Expenses' in temp_df.columns else np.random.uniform(1000, 5000)],
+
+            features = pd.DataFrame({
+                'DayOfWeek': [current_date.dayofweek],
+                'Month': [current_date.month]
             })
 
-            predicted = model.predict(next_features)[0]
+            predicted = model.predict(features)[0]
             results[current_date.strftime("%Y-%m-%d")] = round(float(predicted), 2)
 
-            next_row = {
+            # Append to temp_df (optional, for recursive use)
+            new_row = {
                 'YEAR': current_date.year,
                 'MONTH': current_date.month,
                 'DAY': current_date.day,
-                'Revenue': predicted
+                'AMOUNT': predicted
             }
-            temp_df = pd.concat([temp_df, pd.DataFrame([next_row])], ignore_index=True)
+            temp_df = pd.concat([temp_df, pd.DataFrame([new_row])], ignore_index=True)
 
+        # Build forecast DataFrame
         forecast_df = pd.DataFrame({
             'Date': list(results.keys()),
             'Forecasted_Revenue': list(results.values())
@@ -92,52 +92,40 @@ def forecast():
 
         return jsonify({
             "status": "success",
-            "data": {
-                "daily_forecast": results
-            }
+            "data": {"daily_forecast": results}
         })
 
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-
-# ===========================
-# 🔹 Forecast history API 
-# ===========================
+# ---------- FORECAST HISTORY ----------
 @app.route("/api/revenue/history", methods=["GET"])
 def history():
-    if os.path.exists("forecast_history.csv"):
-        df = pd.read_csv("forecast_history.csv")
-        return jsonify(df.to_dict(orient="records"))
-    else:
-        return jsonify([])
+    try:
+        if os.path.exists("forecast_history.csv"):
+            df = pd.read_csv("forecast_history.csv")
+            return jsonify(df.to_dict(orient="records"))
+        else:
+            return jsonify([])
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-# ===========================
-# 🔹 Forecast download API 
-# ===========================
 
+# ---------- DOWNLOAD FORECAST ----------
 @app.route("/api/revenue/download", methods=["GET"])
 def download_forecast():
-    if os.path.exists("forecast_history.csv"):
-        return send_file("forecast_history.csv", as_attachment=True)
-    else:
-        return jsonify({"status": "error", "message": "No forecast file found"}), 404
+    try:
+        if os.path.exists("forecast_history.csv"):
+            return send_file("forecast_history.csv", as_attachment=True)
+        else:
+            return jsonify({"status": "error", "message": "No forecast file found"}), 404
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ===========================
-# 🔹 Root route
-# ===========================
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({"message": "Forecast API is running."}), 200
-
-
-
-# ===========================
-# 🔧 Run app
-# ===========================
+# ===============================
+# Run Server
+# ===============================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
-
-
+    app.run(host="0.0.0.0", port=5000)
