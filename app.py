@@ -126,7 +126,11 @@ def get_history():
         if request.method == "OPTIONS":
             return jsonify({"status": "ok"}), 200
 
-
+        data = [
+            {"Date": "2025-10-11", "Total_Revenue": 180000, "Accuracy": 97.5},
+            {"Date": "2025-09-11", "Total_Revenue": 175000, "Accuracy": 96.8},
+        ]
+        
         return jsonify({"status": "success", "data": data})
     except Exception as e:
         traceback.print_exc()
@@ -155,4 +159,5 @@ def download_forecast():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
 
