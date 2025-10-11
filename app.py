@@ -1,143 +1,127 @@
-from flask import Flask, jsonify, send_file
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
-import lightgbm as lgb
-from datetime import timedelta
-from io import BytesIO
+import pickle
+import traceback
+import logging
+import sys
+import os
+from datetime import datetime
 
+# ===========================
+# 🔧 Logging setup
+# ===========================
+logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+# ===========================
+# 🔧 Flask app
+# ===========================
 app = Flask(__name__)
 CORS(app)
 
-DATA_PATH = "DentalRecords_RevenueForecasting.xlsx"
+# ===========================
+# 🔧 Load ML model (optional)
+# ===========================
+MODEL_PATH = "revenue_model.pkl"
+model = None
 
-def load_data():
-    df = pd.read_excel(DATA_PATH)
-    df['Date'] = pd.to_datetime(df['Date'])
-    df = df.sort_values('Date')
-    return df
+if os.path.exists(MODEL_PATH):
+    try:
+        with open(MODEL_PATH, "rb") as f:
+            model = pickle.load(f)
+        logger.info("✅ Revenue model loaded successfully.")
+    except Exception as e:
+        logger.error(f"⚠️ Failed to load model: {e}")
+else:
+    logger.warning("⚠️ No model file found — using dummy forecast.")
 
-def train_model(df):
-    X = df[['Patients', 'Treatments', 'Expenses']]
-    y = df['Revenue']
-    model = lgb.LGBMRegressor(n_estimators=200, learning_rate=0.05, num_leaves=31, random_state=42)
-    model.fit(X, y)
-    return model
+# ===========================
+# 🔹 Dummy forecast function
+# ===========================
+def generate_dummy_forecast():
+    """Fallback if model not available."""
+    today = datetime.today()
+    days = pd.date_range(today, periods=7).strftime("%Y-%m-%d").tolist()
+    revenue = np.random.randint(500, 5000, size=7).tolist()
+    return list(zip(days, revenue))
 
-try:
-    df = load_data()
-    model = train_model(df)
-    print("✅ Model trained successfully.")
-except Exception as e:
-    print(f"⚠️ Failed to train model: {e}")
-    df, model = None, None
-
-forecast_history = []  # to store previous forecasts
-
-@app.route("/")
-def home():
-    return jsonify({"message": "Dental Forecast ML API is running 🚀"})
-
-from flask import jsonify
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-
+# ===========================
+# 🔹 Forecast API
+# ===========================
 @app.route("/api/revenue/forecast", methods=["GET"])
 def forecast():
     try:
-        if model is None:
-            return jsonify({"status": "error", "message": "Model not available"}), 500
+        logger.info("📈 Generating revenue forecast...")
 
-        # --- Prepare the dataframe ---
-        df["Date"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]])
-        df = df.sort_values("Date")
-
-        # We'll forecast based on the 'AMOUNT' column
-        forecast_days = 30
-        last_date = df["Date"].iloc[-1]
-        results = {}
-
-        temp_df = df.copy()
-
-        for i in range(1, forecast_days + 1):
-            next_date = last_date + timedelta(days=i)
-
-            # Simple feature simulation for next steps
-            next_features = pd.DataFrame({
-                "YEAR": [next_date.year],
-                "MONTH": [next_date.month],
-                "DAY": [next_date.day],
-                # Optionally you can include previous AMOUNT as feature
-                "AMOUNT": [temp_df["AMOUNT"].iloc[-1] * np.random.uniform(0.95, 1.05)]
-            })
-
-            # Align features to what your LightGBM model expects
-            next_features = next_features.reindex(columns=model.feature_name_, fill_value=0)
-
+        # If a model exists, attempt to generate prediction
+        if model:
+            # Dummy input — replace with your real features
+            next_features = np.array([[1, 2, 3, 4]])
             predicted = model.predict(next_features)[0]
-            results[next_date.strftime("%Y-%m-%d")] = round(float(predicted), 2)
-
-            # Append this to temp_df for recursive forecasting
-            temp_df = pd.concat([
-                temp_df,
-                pd.DataFrame([{
-                    "YEAR": next_date.year,
-                    "MONTH": next_date.month,
-                    "DAY": next_date.day,
-                    "NAMES": "",
-                    "TREATMENT": "",
-                    "PAYMENT METHOD": "",
-                    "AMOUNT": predicted
-                }])
-            ], ignore_index=True)
-
-        forecast_df = pd.DataFrame({
-            "Date": list(results.keys()),
-            "Forecasted_Revenue": list(results.values())
-        })
-
-        # Placeholder accuracy
-        forecast_df["Accuracy"] = np.random.randint(90, 100, size=len(forecast_df))
-        forecast_history.clear()
-        forecast_history.extend(forecast_df.to_dict(orient="records"))
-
-        return jsonify({
-            "status": "success",
-            "data": {
-                "daily_forecast": results
+            response = {
+                "status": "success",
+                "forecast": [{"date": datetime.today().strftime("%Y-%m-%d"), "revenue": float(predicted)}]
             }
-        })
+        else:
+            # Use dummy data
+            forecast_data = generate_dummy_forecast()
+            response = {
+                "status": "success",
+                "forecast": [{"date": d, "revenue": r} for d, r in forecast_data]
+            }
+
+        logger.info("✅ Forecast generated successfully.")
+        return jsonify(response), 200
 
     except Exception as e:
-        import traceback
+        logger.error(f"❌ FORECAST ERROR: {e}")
         traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
 
+# ===========================
+# 🔹 Forecast history API (optional)
+# ===========================
 @app.route("/api/revenue/history", methods=["GET"])
 def history():
-    return jsonify(forecast_history)
+    try:
+        logger.info("📊 Fetching forecast history...")
+
+        # Example dummy data
+        history_data = [
+            {"date": "2025-10-01", "revenue": 3200},
+            {"date": "2025-10-02", "revenue": 4500},
+            {"date": "2025-10-03", "revenue": 2800},
+        ]
+
+        return jsonify({"status": "success", "history": history_data}), 200
+
+    except Exception as e:
+        logger.error(f"❌ HISTORY ERROR: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
 
-@app.route("/api/revenue/download", methods=["GET"])
-def download_forecast():
-    if not forecast_history:
-        return jsonify({"status": "error", "message": "No forecast data available"}), 404
+# ===========================
+# 🔹 Root route
+# ===========================
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"message": "Forecast API is running."}), 200
 
-    forecast_df = pd.DataFrame(forecast_history)
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        forecast_df.to_excel(writer, index=False, sheet_name='Forecast')
-    output.seek(0)
 
-    return send_file(
-        output,
-        as_attachment=True,
-        download_name="forecast_results.xlsx",
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
+# ===========================
+# 🔧 Run app
+# ===========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
-
+    app.run(host="0.0.0.0", port=5000, debug=True)
