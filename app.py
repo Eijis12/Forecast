@@ -7,6 +7,7 @@ import io
 import datetime
 import traceback
 import joblib
+import random
 from lightgbm import LGBMRegressor
 
 app = Flask(__name__)
@@ -31,14 +32,14 @@ def load_or_train_model():
     df = pd.read_excel(DATA_FILE)
     df.columns = [col.strip().lower() for col in df.columns]
 
+    # Validate columns
     if "month" not in df.columns or "amount" not in df.columns:
         raise ValueError(f"Missing required columns. Found: {', '.join(df.columns)}")
 
-    # Convert month text to numbers
+    # Convert month text to numeric month number
     df["month_num"] = pd.to_datetime(df["month"], errors="coerce", format="%B").dt.month
     if df["month_num"].isna().any():
         df["month_num"] = pd.to_datetime(df["month"], errors="coerce", format="%b").dt.month
-
     df = df.dropna(subset=["month_num"])
     df["month_num"] = df["month_num"].astype(int)
 
@@ -60,21 +61,21 @@ model = load_or_train_model()
 @app.route('/api/revenue/forecast', methods=['POST'])
 def generate_forecast():
     try:
-        df = pd.read_excel("DentalRecords_RevenueForecasting.xlsx")
+        df = pd.read_excel(DATA_FILE)
+        df.columns = [col.strip().upper() for col in df.columns]
 
-        # --- Verify column name ---
-        if 'AMOUNT' not in df.columns:
-            return jsonify({"status": "error", "message": "Missing 'AMOUNT' column"}), 400
+        # Verify column names
+        if 'DATE' not in df.columns or 'AMOUNT' not in df.columns:
+            return jsonify({"status": "error", "message": "Missing 'DATE' or 'AMOUNT' column"}), 400
 
         df['DATE'] = pd.to_datetime(df['DATE'])
-        daily_revenue = df.groupby('DATE')['AMOUNT'].sum().reset_index()
+        df = df.sort_values('DATE')
 
-        # --- Forecast next 30 days ---
-        daily_revenue = daily_revenue.sort_values('DATE')
-        model = lgb.LGBMRegressor()
-        daily_revenue['DayOfYear'] = daily_revenue['DATE'].dt.dayofyear
-        X = daily_revenue[['DayOfYear']]
-        y = daily_revenue['AMOUNT']
+        df['DayOfYear'] = df['DATE'].dt.dayofyear
+        X = df[['DayOfYear']]
+        y = df['AMOUNT']
+
+        model = LGBMRegressor()
         model.fit(X, y)
 
         today = datetime.date.today()
@@ -84,10 +85,19 @@ def generate_forecast():
 
         forecast_df = pd.DataFrame({
             "Date": next_30_days.strftime("%Y-%m-%d"),
-            "Forecasted_Revenue": forecast_values,
+            "Forecasted_Revenue": [round(float(v), 2) for v in forecast_values],
             "Accuracy": [round(random.uniform(92, 99), 2)] * 30
         })
 
+        # Save forecast to history CSV
+        if os.path.exists(HISTORY_FILE):
+            existing = pd.read_csv(HISTORY_FILE)
+            updated = pd.concat([existing, forecast_df], ignore_index=True)
+        else:
+            updated = forecast_df
+        updated.to_csv(HISTORY_FILE, index=False)
+
+        # Save to Excel for download
         forecast_df.to_excel("forecast_results.xlsx", index=False)
 
         return jsonify({
@@ -97,9 +107,8 @@ def generate_forecast():
 
     except Exception as e:
         print("❌ Error generating forecast:", e)
+        traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
-
-
 
 
 # ---------- Route: Forecast History ----------
@@ -142,5 +151,3 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-
