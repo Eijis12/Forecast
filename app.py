@@ -60,82 +60,68 @@ model = load_or_train_model()
 @app.route("/api/revenue/forecast", methods=["POST"])
 def forecast_revenue():
     try:
-        print("=== /api/revenue/forecast TRIGGERED ===")
+        excel_path = "DentalRecords_RevenueForecasting.xlsx"
 
-        if not os.path.exists(DATA_FILE):
-            raise FileNotFoundError(f"{DATA_FILE} not found.")
+        if not os.path.exists(excel_path):
+            return jsonify({"status": "error", "message": "Revenue dataset not found."}), 404
 
-        df = pd.read_excel(DATA_FILE)
-        print("Loaded data columns:", list(df.columns))
+        df = pd.read_excel(excel_path)
 
-        df.columns = df.columns.str.strip().str.upper()
-        if "MONTH" not in df.columns or "AMOUNT" not in df.columns:
-            raise ValueError("Missing required columns: MONTH and AMOUNT")
+        # ✅ Ensure column consistency
+        if "MONTH" in df.columns:
+            df.rename(columns={"MONTH": "Date"}, inplace=True)
+        if "REVENUE" in df.columns:
+            df.rename(columns={"REVENUE": "Revenue"}, inplace=True)
 
-        # Clean data
-        df = df[["MONTH", "AMOUNT"]].dropna()
+        # ✅ Convert to datetime
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date", "Revenue"]).sort_values("Date")
 
-        # Parse months (robust)
-        def parse_month(value):
-            try:
-                # Try full and abbreviated month names
-                m = pd.to_datetime(str(value), errors="coerce", format="%B")
-                if pd.isna(m):
-                    m = pd.to_datetime(str(value), errors="coerce", format="%b")
-                if pd.isna(m):
-                    val = str(value).strip().upper()
-                    month_map = {
-                        "JANUARY": 1, "FEBRUARY": 2, "MARCH": 3, "APRIL": 4, "MAY": 5, "JUNE": 6,
-                        "JULY": 7, "AUGUST": 8, "SEPTEMBER": 9, "OCTOBER": 10,
-                        "NOVEMBER": 11, "DECEMBER": 12
-                    }
-                    return month_map.get(val, np.nan)
-                return m.month
-            except Exception:
-                return np.nan
+        # ✅ Prepare the training data
+        df["Day"] = (df["Date"] - df["Date"].min()).dt.days
+        X = df[["Day"]]
+        y = df["Revenue"]
 
-        df["MONTH_NUM"] = df["MONTH"].apply(parse_month)
-        df["AMOUNT"] = pd.to_numeric(df["AMOUNT"], errors="coerce")
-        df = df.dropna(subset=["MONTH_NUM", "AMOUNT"])
-
-        print(f"✅ Cleaned data shape: {df.shape}")
-        if df.empty:
-            raise ValueError("No valid MONTH or AMOUNT data found.")
-
-        # Train model
-        X = df[["MONTH_NUM"]]
-        y = df["AMOUNT"]
-        model = LGBMRegressor()
+        model = lgb.LGBMRegressor()
         model.fit(X, y)
-        print("✅ Model trained successfully.")
 
-        # Predict for 12 months
-        months = np.arange(1, 13)
-        preds = model.predict(pd.DataFrame({"MONTH_NUM": months}))
+        # ✅ Forecast for the next 30 days from TODAY
+        today = datetime.datetime.now()
+        future_dates = pd.date_range(today, today + datetime.timedelta(days=30), freq="D")
 
-        results = []
-        for i, pred in enumerate(preds):
-            results.append({
-                "Date": datetime.date(2025, i + 1, 1).strftime("%B"),
-                "Forecasted_Revenue": round(float(pred), 2),
-                "Accuracy": round(np.random.uniform(92, 98), 2)
-            })
+        # Map to numeric "Day" index continuing from last
+        last_day = df["Day"].max()
+        future_days = np.arange(last_day + 1, last_day + len(future_dates) + 1).reshape(-1, 1)
 
-        # Save to CSV history
-        df_hist = pd.DataFrame(results)
-        df_hist["timestamp"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # ✅ Predict
+        future_forecast = model.predict(future_days)
 
-        if os.path.exists(HISTORY_FILE):
-            df_hist.to_csv(HISTORY_FILE, mode="a", header=False, index=False)
-        else:
-            df_hist.to_csv(HISTORY_FILE, index=False)
+        forecast_df = pd.DataFrame({
+            "Date": future_dates.strftime("%Y-%m-%d"),
+            "Forecasted_Revenue": future_forecast.round(2)
+        })
 
-        print("✅ Forecast completed successfully.")
-        return jsonify({"status": "success", "forecast": results})
+        # ✅ Save to Excel for download
+        output_path = "forecast_results.xlsx"
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            forecast_df.to_excel(writer, index=False, sheet_name="Forecast")
+
+        # ✅ Save history to memory (optional for your /api/revenue/history route)
+        forecast_df.to_csv("forecast_history.csv", index=False)
+
+        return jsonify({
+            "status": "success",
+            "message": "30-day real-time forecast generated.",
+            "data": forecast_df.to_dict(orient="records")
+        })
 
     except Exception as e:
-        print("❌ Forecast error:\n", traceback.format_exc())
-        return jsonify({"status": "error", "message": str(e)}), 500
+        traceback.print_exc()
+        return jsonify({
+            "status": "error",
+            "message": f"Error generating forecast: {str(e)}"
+        }), 500
+
 
 
 # ---------- Route: Forecast History ----------
@@ -178,3 +164,4 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
