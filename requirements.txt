@@ -8,3 +8,4 @@ statsmodels
 gunicorn
 lightgbm
 joblib
+xlsxwriter
