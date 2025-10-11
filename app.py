@@ -16,13 +16,13 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # ---------- File paths ----------
 DATA_FILE = "DentalRecords_RevenueForecasting.xlsx"
 MODEL_FILE = "trained_model.pkl"
-HISTORY_FILE = "/tmp/forecast_history.csv"  # 🔧 Save to /tmp for Render compatibility
-FORECAST_FILE = "/tmp/forecast_results.xlsx"  # 🔧 Also save forecast file in /tmp
+HISTORY_FILE = "/tmp/forecast_history.csv"      # ✅ Render-safe path
+FORECAST_FILE = "/tmp/forecast_results.xlsx"    # ✅ Render-safe path
 
 
 # ---------- Helper: Load or train model ----------
 def load_or_train_model():
-    """Load existing model or train a new one."""
+    """Load existing model or train a new one if not found."""
     if os.path.exists(MODEL_FILE):
         print("✅ Loaded existing model from disk.")
         return joblib.load(MODEL_FILE)
@@ -57,12 +57,24 @@ def load_or_train_model():
 model = load_or_train_model()
 
 
-# ---------- Route: Generate Forecast ----------
-@app.route('/api/revenue/forecast', methods=['POST'])
+# ============================================================
+# ✅ Forecast Route (POST + GET for debugging + OPTIONS)
+# ============================================================
+@app.route('/api/revenue/forecast', methods=['POST', 'GET', 'OPTIONS'])
 def generate_forecast():
+    # --- Handle CORS preflight ---
+    if request.method == "OPTIONS":
+        print("🟡 OPTIONS preflight check received.")
+        return jsonify({"status": "ok"}), 200
+
+    # --- Debug: check wrong GET requests ---
+    if request.method == "GET":
+        print("⚠️ Received GET instead of POST — check frontend JS.")
+        return jsonify({"status": "error", "message": "Use POST for forecasting."}), 405
+
     try:
-        print("🟢 /api/revenue/forecast called")  # 🔧 Helps debug live logs
-        _ = request.get_json(silent=True)  # 🔧 Safely parse body (even if empty)
+        print("🟢 /api/revenue/forecast called (POST)")
+        _ = request.get_json(silent=True)  # Safely parse JSON even if empty
 
         if not os.path.exists(DATA_FILE):
             return jsonify({"status": "error", "message": "Data file not found."}), 404
@@ -76,7 +88,7 @@ def generate_forecast():
         daily_revenue = df.groupby('DATE')['AMOUNT'].sum().reset_index()
         daily_revenue = daily_revenue.sort_values('DATE')
 
-        # --- Train model ---
+        # --- Train LightGBM model ---
         daily_revenue['DayOfYear'] = daily_revenue['DATE'].dt.dayofyear
         X = daily_revenue[['DayOfYear']]
         y = daily_revenue['AMOUNT']
@@ -100,52 +112,72 @@ def generate_forecast():
         forecast_df.to_csv(HISTORY_FILE, index=False)
         forecast_df.to_excel(FORECAST_FILE, index=False)
 
-        print("✅ Forecast generated successfully with", len(forecast_df), "rows")
-
-        return jsonify({
-            "status": "success",
-            "data": forecast_df.to_dict(orient="records")
-        })
+        print(f"✅ Forecast generated successfully ({len(forecast_df)} rows)")
+        return jsonify({"status": "success", "data": forecast_df.to_dict(orient="records")})
 
     except Exception as e:
         print("❌ Error generating forecast:", traceback.format_exc())
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ---------- Route: Forecast History ----------
+# ============================================================
+# ✅ Forecast History Route
+# ============================================================
 @app.route("/api/revenue/history", methods=["GET"])
 def get_forecast_history():
     try:
         if not os.path.exists(HISTORY_FILE):
+            print("ℹ️ No forecast history found.")
             return jsonify([])
 
         df = pd.read_csv(HISTORY_FILE)
+        print(f"📊 Returning {len(df)} forecast history entries.")
         return jsonify(df.to_dict(orient="records"))
     except Exception as e:
         print("❌ History load error:", e)
         return jsonify([])
 
 
-# ---------- Route: Download Forecast ----------
+# ============================================================
+# ✅ Download Forecast Route
+# ============================================================
 @app.route("/api/revenue/download", methods=["GET"])
 def download_forecast():
     try:
         if not os.path.exists(FORECAST_FILE):
+            print("⚠️ Forecast file not found.")
             return jsonify({"status": "error", "message": "No forecast file found"}), 404
 
+        print("⬇️ Sending forecast_results.xlsx to client.")
         return send_file(FORECAST_FILE, as_attachment=True)
     except Exception as e:
         print("❌ Download error:", e)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ---------- Root ----------
+# ============================================================
+# ✅ Root Route
+# ============================================================
 @app.route("/")
 def home():
     return jsonify({"status": "ok", "message": "Revenue Forecast API is running."})
 
 
-# ---------- Start ----------
+# ============================================================
+# ✅ Global CORS Headers
+# ============================================================
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+    return response
+
+
+# ============================================================
+# ✅ Start Server
+# ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    print(f"🚀 Server starting on port {port}")
     app.run(host="0.0.0.0", port=port)
