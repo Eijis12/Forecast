@@ -157,20 +157,42 @@ def get_history():
 @app.route("/api/revenue/download", methods=["GET"])
 def download_forecast():
     try:
+        # Generate latest forecast
         result = generate_forecast()
-        df = pd.DataFrame(list(result["daily_forecast"].items()), columns=["Date", "Forecasted_Revenue"])
-        df["Accuracy"] = result["accuracy"]
+        forecast_df = pd.DataFrame(list(result["daily_forecast"].items()), columns=["Date", "Forecasted_Revenue"])
+        forecast_df["Accuracy"] = result["accuracy"]
 
+        # === Append to forecast history ===
+        history_path = "forecast_history.csv"
+        if os.path.exists(history_path):
+            history_df = pd.read_csv(history_path)
+            combined_df = pd.concat([history_df, forecast_df], ignore_index=True)
+        else:
+            combined_df = forecast_df
+
+        # Save combined history
+        combined_df.to_csv(history_path, index=False)
+
+        # === Generate downloadable Excel file ===
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False, sheet_name="Forecast")
+            forecast_df.to_excel(writer, index=False, sheet_name="Latest_Forecast")
+            combined_df.to_excel(writer, index=False, sheet_name="Forecast_History")
         output.seek(0)
 
-        return send_file(output, as_attachment=True, download_name="RevenueForecast.xlsx")
+        return send_file(
+            output,
+            as_attachment=True,
+            download_name="RevenueForecast_History.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
