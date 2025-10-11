@@ -1,170 +1,97 @@
-import os
-import json
-import pandas as pd
-import numpy as np
-from datetime import datetime
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from lightgbm import LGBMRegressor
+import pandas as pd
+import lightgbm as lgb
+import numpy as np
 import joblib
+import os
+from datetime import datetime
 
-app = Flask(__name__, static_folder='frontend/build', static_url_path='')
+app = Flask(__name__)
 CORS(app)
 
-MODEL_PATH = "revenue_model.pkl"
-FORECAST_HISTORY_PATH = "forecast_history.csv"
-DATA_PATH = "DentalRecords_RevenueForecasting.xlsx"
+DATA_FILE = "DentalRecords_RevenueForecasting.xlsx"
+MODEL_FILE = "trained_model.pkl"
+HISTORY_FILE = "forecast_history.csv"
 
-# ---------- Utility Functions ----------
 
-def load_data():
-    """Load and clean dataset, handling both month names and dates."""
-    if not os.path.exists(DATA_PATH):
-        raise FileNotFoundError(f"{DATA_PATH} not found in directory.")
-
-    df = pd.read_excel(DATA_PATH)
-
-    # Try to detect a usable date column
-    if 'Date' in df.columns:
-        try:
-            df['Date'] = pd.to_datetime(df['Date'])
-        except Exception:
-            # fallback if contains text months
-            df['Date'] = pd.to_datetime(df['Date'] + ' 2025', format='%B %Y')
-    elif 'Month' in df.columns:
-        # Example: "January", "February"
-        df['Date'] = pd.to_datetime(df['Month'] + ' 2025', format='%B %Y')
+# ---------- Helper: Load or train model ----------
+def load_or_train_model():
+    if os.path.exists(MODEL_FILE):
+        return joblib.load(MODEL_FILE)
     else:
-        raise ValueError("No 'Date' or 'Month' column found in dataset.")
+        if not os.path.exists(DATA_FILE):
+            raise FileNotFoundError(f"{DATA_FILE} not found.")
 
-    # Try to find the revenue column
-    revenue_col = None
-    for col in df.columns:
-        if 'revenue' in col.lower() or 'income' in col.lower() or 'sales' in col.lower():
-            revenue_col = col
-            break
-    if not revenue_col:
-        raise ValueError("No column found for revenue/income/sales.")
+        df = pd.read_excel(DATA_FILE)
 
-    df = df[['Date', revenue_col]].rename(columns={revenue_col: 'Revenue'})
-    df = df.sort_values('Date')
-    df = df.set_index('Date')
-    return df
+        # Auto-fix: Convert months if text-based
+        if 'Month' in df.columns:
+            try:
+                df['Month'] = pd.to_datetime(df['Month'], errors='coerce')
+            except:
+                df['Month'] = pd.to_datetime(df['Month'], format='%B', errors='coerce')
+        else:
+            raise ValueError("Missing 'Month' column in dataset.")
 
+        df = df.dropna(subset=['Month'])
+        df['Month_Num'] = df['Month'].dt.month
 
-def train_model():
-    """Train and save the LightGBM model."""
-    df = load_data()
+        if 'Revenue' not in df.columns:
+            raise ValueError("Missing 'Revenue' column in dataset.")
 
-    # Create features
-    df['month'] = df.index.month
-    df['year'] = df.index.year
-    df['prev_revenue'] = df['Revenue'].shift(1)
-    df = df.dropna()
+        X = df[['Month_Num']]
+        y = df['Revenue']
 
-    X = df[['month', 'year', 'prev_revenue']]
-    y = df['Revenue']
-
-    model = LGBMRegressor(n_estimators=100, learning_rate=0.1, random_state=42)
-    model.fit(X, y)
-    joblib.dump(model, MODEL_PATH)
-    return model
+        model = lgb.LGBMRegressor()
+        model.fit(X, y)
+        joblib.dump(model, MODEL_FILE)
+        return model
 
 
-def load_model():
-    """Load existing model or train a new one if missing."""
-    if os.path.exists(MODEL_PATH):
-        return joblib.load(MODEL_PATH)
-    else:
-        return train_model()
+model = load_or_train_model()
 
 
-def save_forecast_to_history(forecast_value):
-    """Save forecast result with timestamp to history file."""
-    history_entry = pd.DataFrame([{
-        'Date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        'Forecasted Revenue': forecast_value
-    }])
-
-    if os.path.exists(FORECAST_HISTORY_PATH):
-        history = pd.read_csv(FORECAST_HISTORY_PATH)
-        history = pd.concat([history, history_entry], ignore_index=True)
-    else:
-        history = history_entry
-
-    history.to_csv(FORECAST_HISTORY_PATH, index=False)
-
-
-def get_forecast_history():
-    """Read forecast history CSV if it exists."""
-    if os.path.exists(FORECAST_HISTORY_PATH):
-        return pd.read_csv(FORECAST_HISTORY_PATH).to_dict(orient="records")
-    return []
-
-# ---------- Routes ----------
-
-@app.route('/')
-def serve():
-    return send_from_directory(app.static_folder, 'index.html')
-
-
+# ---------- Route: Generate Forecast ----------
 @app.route('/api/revenue/forecast', methods=['POST'])
 def generate_forecast():
     try:
-        model = load_model()
-        df = load_data()
+        future_months = np.arange(1, 13).reshape(-1, 1)
+        predictions = model.predict(future_months)
 
-        last_row = df.iloc[-1]
-        next_month = last_row.name.month + 1
-        next_year = last_row.name.year
-        if next_month > 12:
-            next_month = 1
-            next_year += 1
+        results = []
+        for i, pred in enumerate(predictions):
+            results.append({
+                "month": datetime(2025, i + 1, 1).strftime("%B"),
+                "revenue": float(pred)
+            })
 
-        X_new = pd.DataFrame([{
-            'month': next_month,
-            'year': next_year,
-            'prev_revenue': last_row['Revenue']
-        }])
+        # Save history
+        df_hist = pd.DataFrame(results)
+        df_hist['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        forecast = model.predict(X_new)[0]
-        save_forecast_to_history(float(forecast))
+        if os.path.exists(HISTORY_FILE):
+            df_hist.to_csv(HISTORY_FILE, mode='a', header=False, index=False)
+        else:
+            df_hist.to_csv(HISTORY_FILE, index=False)
 
-        return jsonify({
-            "message": "Forecast generated successfully!",
-            "forecast": float(forecast)
-        })
+        return jsonify({"status": "success", "forecast": results})
 
     except Exception as e:
-        print("Error generating forecast:", e)
-        return jsonify({"message": str(e), "status": "error"}), 500
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
+# ---------- Route: Forecast History ----------
 @app.route('/api/revenue/history', methods=['GET'])
-def get_history():
-    try:
-        data = get_forecast_history()
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"message": str(e), "status": "error"}), 500
+def get_forecast_history():
+    if not os.path.exists(HISTORY_FILE):
+        return jsonify([])
+    df = pd.read_csv(HISTORY_FILE)
+    records = df.to_dict(orient='records')
+    return jsonify(records)
 
 
-# ---------- Appointments & Users (Dummy Endpoints for UI) ----------
-
-@app.route('/api/users', methods=['POST'])
-def create_user():
-    return jsonify({"message": "User created successfully!"})
-
-
-@app.route('/api/appointments', methods=['GET', 'POST'])
-def appointments():
-    return jsonify({"message": "Appointments endpoint placeholder."})
-
-
-# ---------- Run App ----------
-
+# ---------- Render-compatible startup ----------
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-
