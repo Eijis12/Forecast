@@ -55,22 +55,29 @@ def forecast():
     try:
         logger.info("📈 Generating revenue forecast...")
 
-        # If a model exists, attempt to generate prediction
+        forecast_data = {}
+
         if model:
-            # Dummy input — replace with your real features
-            next_features = np.array([[1, 2, 3, 4]])
-            predicted = model.predict(next_features)[0]
-            response = {
-                "status": "success",
-                "forecast": [{"date": datetime.today().strftime("%Y-%m-%d"), "revenue": float(predicted)}]
-            }
+            # Example prediction logic
+            today = datetime.today()
+            for i in range(7):
+                date = (today + pd.Timedelta(days=i)).strftime("%Y-%m-%d")
+                next_features = np.array([[1, 2, 3, 4]])  # replace with actual features
+                predicted = float(model.predict(next_features)[0])
+                forecast_data[date] = round(predicted, 2)
         else:
-            # Use dummy data
-            forecast_data = generate_dummy_forecast()
-            response = {
-                "status": "success",
-                "forecast": [{"date": d, "revenue": r} for d, r in forecast_data]
+            # Dummy 7-day forecast
+            today = datetime.today()
+            for i in range(7):
+                date = (today + pd.Timedelta(days=i)).strftime("%Y-%m-%d")
+                forecast_data[date] = int(np.random.randint(1000, 5000))
+
+        response = {
+            "status": "success",
+            "data": {
+                "daily_forecast": forecast_data
             }
+        }
 
         logger.info("✅ Forecast generated successfully.")
         return jsonify(response), 200
@@ -83,6 +90,7 @@ def forecast():
             "message": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
 
 
 # ===========================
@@ -125,3 +133,4 @@ def home():
 # ===========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
