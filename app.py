@@ -162,8 +162,10 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
 
 @app.route("/api/revenue/forecast", methods=["GET"])
 def revenue_forecast():
+    print("⚙️ Forecast request received...")
     try:
         result = forecast_next_month()
+        print("✅ Forecast generated successfully")
         return jsonify({
             "status": "success",
             "message": "Revenue forecast generated successfully",
@@ -178,8 +180,10 @@ def revenue_forecast():
             }
         })
     except Exception as e:
-        traceback.print_exc()
+        print("❌ Forecast failed:")
+        traceback.print_exc()  # This prints the full error stack to your Render logs
         return jsonify({"status": "error", "message": str(e)}), 500
+
 
 
 @app.route("/api/revenue/history", methods=["GET"])
@@ -220,3 +224,4 @@ def download_forecast():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
