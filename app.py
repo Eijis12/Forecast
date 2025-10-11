@@ -1,94 +1,105 @@
 from flask import Flask, jsonify, send_file
-from flask_cors import CORS
 import pandas as pd
 import numpy as np
 from datetime import timedelta
-import lightgbm as lgb
+from lightgbm import LGBMRegressor
 import os
 
 app = Flask(__name__)
-CORS(app)
 
-# ===============================
-# Load Dataset and Train Model
-# ===============================
-try:
-    df = pd.read_csv("revenue_data.csv")  # your dataset
-    df['Date'] = pd.to_datetime(df[['YEAR', 'MONTH', 'DAY']])
+# ==========================
+# GLOBAL VARIABLES
+# ==========================
+model = None
+df = None
+forecast_history = []
 
-    # Aggregate daily revenue (sum of AMOUNT)
-    daily_revenue = df.groupby('Date')['AMOUNT'].sum().reset_index()
-    daily_revenue['DayOfWeek'] = daily_revenue['Date'].dt.dayofweek
-    daily_revenue['Month'] = daily_revenue['Date'].dt.month
+DATA_FILE = "revenue_data.csv"
 
-    # Features and target
-    X = daily_revenue[['DayOfWeek', 'Month']]
-    y = daily_revenue['AMOUNT']
 
-    # Train LightGBM model
-    model = lgb.LGBMRegressor()
+# ==========================
+# LOAD AND TRAIN MODEL
+# ==========================
+def load_and_train_model():
+    global model, df
+
+    if not os.path.exists(DATA_FILE):
+        print("⚠️ No dataset found — create revenue_data.csv first.")
+        return
+
+    df = pd.read_csv(DATA_FILE)
+
+    # 🧹 Clean & prepare data
+    df.columns = df.columns.str.strip().str.upper()
+    df['AMOUNT'] = pd.to_numeric(df['AMOUNT'], errors='coerce').fillna(0)
+
+    if not {'YEAR', 'MONTH', 'DAY'}.issubset(df.columns):
+        print("❌ Missing columns YEAR, MONTH, DAY in CSV")
+        return
+
+    df['DATE'] = pd.to_datetime(df[['YEAR', 'MONTH', 'DAY']])
+    df = df.sort_values('DATE')
+
+    # ✅ Use previous days’ data as features
+    df['REVENUE'] = df['AMOUNT']
+    df['LAG1'] = df['REVENUE'].shift(1)
+    df['LAG2'] = df['REVENUE'].shift(2)
+    df = df.dropna()
+
+    X = df[['LAG1', 'LAG2']]
+    y = df['REVENUE']
+
+    # Train LightGBM
+    model = LGBMRegressor()
     model.fit(X, y)
 
-    print("✅ LightGBM model trained successfully.")
-except Exception as e:
-    print(f"⚠️ Model training failed: {e}")
-    model = None
-
-# ===============================
-# Routes
-# ===============================
-
-@app.route("/")
-def home():
-    return jsonify({"status": "ok", "message": "Forecast API is running."})
+    print("✅ Model trained successfully!")
 
 
-# ---------- FORECAST ----------
+# ==========================
+# FORECAST ENDPOINT
+# ==========================
 @app.route("/api/revenue/forecast", methods=["GET"])
 def forecast():
-    if model is None:
+    global model, df, forecast_history
+
+    if model is None or df is None:
         return jsonify({"status": "error", "message": "Model not available"}), 500
 
     try:
         forecast_days = 30
-        last_date = df[['YEAR', 'MONTH', 'DAY']].iloc[-1]
-        current_date = pd.Timestamp(year=int(last_date['YEAR']),
-                                    month=int(last_date['MONTH']),
-                                    day=int(last_date['DAY']))
-
+        temp_df = df.copy()
         results = {}
 
-        # Use the last known month/day pattern
-        temp_df = df.copy()
-        for _ in range(forecast_days):
-            current_date += timedelta(days=1)
+        for i in range(forecast_days):
+            last_row = temp_df.iloc[-1]
+            lag1, lag2 = last_row['REVENUE'], temp_df.iloc[-2]['REVENUE']
 
-            features = pd.DataFrame({
-                'DayOfWeek': [current_date.dayofweek],
-                'Month': [current_date.month]
-            })
+            next_features = pd.DataFrame([[lag1, lag2]], columns=['LAG1', 'LAG2'])
+            predicted = model.predict(next_features)[0]
+            predicted = max(predicted, 0)
 
-            predicted = model.predict(features)[0]
-            results[current_date.strftime("%Y-%m-%d")] = round(float(predicted), 2)
+            next_date = last_row['DATE'] + timedelta(days=1)
+            results[next_date.strftime("%Y-%m-%d")] = round(float(predicted), 2)
 
-            # Append to temp_df (optional, for recursive use)
-            new_row = {
-                'YEAR': current_date.year,
-                'MONTH': current_date.month,
-                'DAY': current_date.day,
-                'AMOUNT': predicted
-            }
-            temp_df = pd.concat([temp_df, pd.DataFrame([new_row])], ignore_index=True)
+            # Append next row
+            temp_df = pd.concat([
+                temp_df,
+                pd.DataFrame({
+                    'DATE': [next_date],
+                    'REVENUE': [predicted],
+                    'LAG1': [lag1],
+                    'LAG2': [lag2]
+                })
+            ], ignore_index=True)
 
-        # Build forecast DataFrame
+        # ✅ Save forecast history for the table
         forecast_df = pd.DataFrame({
             'Date': list(results.keys()),
             'Forecasted_Revenue': list(results.values())
         })
         forecast_df['Accuracy'] = np.random.randint(90, 100, size=len(forecast_df))
-
-        # ✅ Save to CSV for persistence
-        forecast_df.to_csv("forecast_history.csv", index=False)
+        forecast_history = forecast_df.to_dict(orient="records")
 
         return jsonify({
             "status": "success",
@@ -96,36 +107,39 @@ def forecast():
         })
 
     except Exception as e:
+        print("⚠️ Forecast error:", e)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ---------- FORECAST HISTORY ----------
+# ==========================
+# FORECAST HISTORY
+# ==========================
 @app.route("/api/revenue/history", methods=["GET"])
-def history():
-    try:
-        if os.path.exists("forecast_history.csv"):
-            df = pd.read_csv("forecast_history.csv")
-            return jsonify(df.to_dict(orient="records"))
-        else:
-            return jsonify([])
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+def get_forecast_history():
+    global forecast_history
+    if not forecast_history:
+        return jsonify([])  # empty but valid
+    return jsonify(forecast_history)
 
 
-# ---------- DOWNLOAD FORECAST ----------
+# ==========================
+# DOWNLOAD FORECAST
+# ==========================
 @app.route("/api/revenue/download", methods=["GET"])
 def download_forecast():
-    try:
-        if os.path.exists("forecast_history.csv"):
-            return send_file("forecast_history.csv", as_attachment=True)
-        else:
-            return jsonify({"status": "error", "message": "No forecast file found"}), 404
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    global forecast_history
+    if not forecast_history:
+        return jsonify({"error": "No forecast data available"}), 404
+
+    df_out = pd.DataFrame(forecast_history)
+    file_path = "forecast_history.csv"
+    df_out.to_csv(file_path, index=False)
+    return send_file(file_path, as_attachment=True)
 
 
-# ===============================
-# Run Server
-# ===============================
+# ==========================
+# MAIN
+# ==========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    load_and_train_model()
+    app.run(host="0.0.0.0", port=5000, debug=True)
