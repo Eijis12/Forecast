@@ -73,9 +73,9 @@ def generate_forecast():
     model = lgb.LGBMRegressor(objective="regression", n_estimators=120, learning_rate=0.1)
     model.fit(X, y)
 
-    # === Predict next 12 months ===
-    last_date = df["Date"].max()
-    future_dates = [last_date + pd.DateOffset(months=i) for i in range(1, 13)]
+# === Predict next 30 days starting from today ===
+start_date = pd.Timestamp.today().normalize()
+future_dates = [start_date + pd.Timedelta(days=i) for i in range(1, 31)]
 
     future_df = pd.DataFrame({
         "Date": future_dates,
@@ -155,3 +155,4 @@ def download_forecast():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
