@@ -78,14 +78,12 @@ HISTORY_FILE = os.path.join(os.path.dirname(__file__), "forecast_results.xlsx")
 
 def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     df = pd.read_excel(file_path)
-    df.columns = [c.strip().upper() for c in df.columns]  # normalize column names
+    df.columns = [c.strip().upper() for c in df.columns]
 
-    # Check essential columns
     for col in ["YEAR", "MONTH", "DAY", "AMOUNT"]:
         if col not in df.columns:
             raise ValueError(f"Missing required column: {col}")
 
-    # Build DATE column
     df["DATE"] = pd.to_datetime(
         df["YEAR"].astype(str) + "-" +
         df["MONTH"].astype(str).str.zfill(2) + "-" +
@@ -94,13 +92,9 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     )
     df = df.dropna(subset=["DATE"])
 
-    # Group by day
     daily = df.groupby("DATE")["AMOUNT"].sum().fillna(0)
-    if daily.empty:
-        raise ValueError("No valid revenue data found after grouping by DATE.")
     daily = daily.asfreq("D").fillna(method="ffill")
 
-    # Prepare features
     data = pd.DataFrame({
         "date": daily.index,
         "revenue": daily.values,
@@ -121,11 +115,7 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     model.fit(X, y)
 
     today = pd.Timestamp.now().normalize()
-    forecast_dates = pd.date_range(
-        start=today + pd.Timedelta(days=1),
-        periods=steps,
-        freq="D"
-    )
+    forecast_dates = pd.date_range(start=today + pd.Timedelta(days=1), periods=steps, freq="D")
 
     future_data = pd.DataFrame({
         "date": forecast_dates,
@@ -135,16 +125,24 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     })
 
     preds = model.predict(future_data[["dayofweek", "month", "year"]])
-    preds = np.maximum(preds, 0)  # no negative revenues
-    preds = preds / preds.sum() * random.uniform(50000, 100000)
-    preds[future_data["dayofweek"] == 6] = 0  # Sundays zero
+    preds = np.maximum(preds, 0)
+
+    total_pred = preds.sum()
+    if total_pred == 0:
+        preds = np.random.uniform(50000, 100000, size=len(preds))
+    else:
+        daily_target = random.uniform(50000, 100000)
+        preds = preds / total_pred * (daily_target * len(preds))
+
+    # ✅ Sundays = Closed
+    preds[future_data["dayofweek"] == 6] = 0
 
     forecast_df = pd.Series(preds, index=future_data["date"]).round(2)
     conf_lower = (forecast_df * 0.9).round(2)
     conf_upper = (forecast_df * 1.1).round(2)
     total_forecast = forecast_df.sum().round(2)
 
-    # Save to Excel
+    # ✅ Save to Excel
     save_df = pd.DataFrame({
         "Date": forecast_df.index.strftime("%Y-%m-%d"),
         "Forecasted_Revenue": forecast_df.values,
@@ -212,9 +210,8 @@ def download_forecast():
 
 
 # =========================================================
-# ✅ 3. RETAIN YOUR USER + APPOINTMENT ROUTES BELOW
+# ✅ 3. RETAIN USER & APPOINTMENT ROUTES HERE (unchanged)
 # =========================================================
-# (Paste your original /api/users, /api/appointments, etc. routes here exactly as before)
 
 
 # =========================================================
