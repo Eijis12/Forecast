@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, jsonify, send_file
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
@@ -6,76 +6,21 @@ import os
 import datetime
 import random
 import traceback
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.model_selection import train_test_split
 import lightgbm as lgb
-import io
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # =========================================================
-# ✅ 1. DIAGNOSIS PREDICTION SETUP
-# =========================================================
-FILE_PATH = os.path.join(os.path.dirname(__file__), "dental_health_forecasting.xlsx")
-df = pd.read_excel(FILE_PATH)
-
-df = df.dropna(subset=["Diagnosis"])
-df["Symptoms"] = df["Symptoms"].fillna("")
-df["Treatment"] = df["Treatment"].fillna("")
-df["input_text"] = df["Symptoms"] + " " + df["Treatment"]
-
-X_train, X_test, y_train, y_test = train_test_split(
-    df["input_text"], df["Diagnosis"], test_size=0.2, random_state=42
-)
-
-model = Pipeline([
-    ("tfidf", TfidfVectorizer(stop_words="english")),
-    ("clf", LogisticRegression(max_iter=1000))
-])
-model.fit(X_train, y_train)
-
-unique_treatments = sorted(df["Treatment"].dropna().unique().tolist())
-
-
-@app.route("/")
-def home():
-    return jsonify({"message": "Dental Forecast ML API is running 🚀"})
-
-
-@app.route("/api/treatments", methods=["GET"])
-def treatments():
-    return jsonify(unique_treatments)
-
-
-@app.route("/api/forecast", methods=["POST"])
-def forecast():
-    data = request.get_json()
-    treatment_input = data.get("treatment", "").strip()
-    symptom_input = data.get("symptom", "").strip()
-
-    if not symptom_input and not treatment_input:
-        return jsonify({"error": "Please provide at least one symptom or treatment."}), 400
-
-    input_text = f"{symptom_input} {treatment_input}".strip()
-    predicted_diagnosis = model.predict([input_text])[0]
-    confidence = round(float(max(model.predict_proba([input_text])[0])), 2)
-
-    return jsonify({
-        "predicted_diagnosis": predicted_diagnosis,
-        "confidence": confidence
-    })
-
-
-# =========================================================
-# ✅ 2. REVENUE FORECASTING
+# ✅ FILE PATHS
 # =========================================================
 REVENUE_FILE = os.path.join(os.path.dirname(__file__), "DentalRecords_RevenueForecasting.xlsx")
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "forecast_results.xlsx")
 
 
+# =========================================================
+# ✅ FORECAST FUNCTION
+# =========================================================
 def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     df = pd.read_excel(file_path)
     df.columns = [c.strip().upper() for c in df.columns]
@@ -92,12 +37,15 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     )
     df = df.dropna(subset=["DATE"])
 
+    # Aggregate daily totals
     daily = df.groupby("DATE")["AMOUNT"].sum().fillna(0)
+    if daily.empty:
+        raise ValueError("No valid revenue data found.")
     daily = daily.asfreq("D").fillna(method="ffill")
 
     data = pd.DataFrame({
         "date": daily.index,
-        "revenue": daily.values,
+        "revenue": daily.values
     })
     data["dayofweek"] = data["date"].dt.dayofweek
     data["month"] = data["date"].dt.month
@@ -115,7 +63,11 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     model.fit(X, y)
 
     today = pd.Timestamp.now().normalize()
-    forecast_dates = pd.date_range(start=today + pd.Timedelta(days=1), periods=steps, freq="D")
+    forecast_dates = pd.date_range(
+        start=today + pd.Timedelta(days=1),
+        periods=steps,
+        freq="D"
+    )
 
     future_data = pd.DataFrame({
         "date": forecast_dates,
@@ -126,23 +78,24 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
 
     preds = model.predict(future_data[["dayofweek", "month", "year"]])
     preds = np.maximum(preds, 0)
+    preds = preds / preds.sum() * random.uniform(50000, 100000)
 
-    total_pred = preds.sum()
-    if total_pred == 0:
-        preds = np.random.uniform(50000, 100000, size=len(preds))
-    else:
-        daily_target = random.uniform(50000, 100000)
-        preds = preds / total_pred * (daily_target * len(preds))
-
-    # ✅ Sundays = Closed
+    # Sundays (dayofweek == 6) should be 0
     preds[future_data["dayofweek"] == 6] = 0
 
     forecast_df = pd.Series(preds, index=future_data["date"]).round(2)
+
+    # Adjust so that next Sunday (10/12/2025) is recognized correctly
+    forecast_df.index = pd.to_datetime(forecast_df.index)
+    sundays = forecast_df[forecast_df.index.dayofweek == 6].index
+    if len(sundays) > 0:
+        forecast_df.loc[sundays] = 0  # enforce zero on Sundays
+
     conf_lower = (forecast_df * 0.9).round(2)
     conf_upper = (forecast_df * 1.1).round(2)
     total_forecast = forecast_df.sum().round(2)
 
-    # ✅ Save to Excel
+    # Save forecast history
     save_df = pd.DataFrame({
         "Date": forecast_df.index.strftime("%Y-%m-%d"),
         "Forecasted_Revenue": forecast_df.values,
@@ -160,12 +113,19 @@ def forecast_next_month(file_path=REVENUE_FILE, steps=30):
     }
 
 
+# =========================================================
+# ✅ ROUTES
+# =========================================================
+
+@app.route("/")
+def home():
+    return jsonify({"message": "Dental Forecast ML API is running 🚀"})
+
+
 @app.route("/api/revenue/forecast", methods=["GET"])
 def revenue_forecast():
-    print("⚙️ Forecast request received...")
     try:
         result = forecast_next_month()
-        print("✅ Forecast generated successfully")
         return jsonify({
             "status": "success",
             "message": "Revenue forecast generated successfully",
@@ -180,10 +140,8 @@ def revenue_forecast():
             }
         })
     except Exception as e:
-        print("❌ Forecast failed:")
-        traceback.print_exc()  # This prints the full error stack to your Render logs
+        traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
-
 
 
 @app.route("/api/revenue/history", methods=["GET"])
@@ -214,14 +172,8 @@ def download_forecast():
 
 
 # =========================================================
-# ✅ 3. RETAIN USER & APPOINTMENT ROUTES HERE (unchanged)
-# =========================================================
-
-
-# =========================================================
 # ✅ RUN APP
 # =========================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
