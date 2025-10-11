@@ -16,7 +16,8 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # ---------- File paths ----------
 DATA_FILE = "DentalRecords_RevenueForecasting.xlsx"
 MODEL_FILE = "trained_model.pkl"
-HISTORY_FILE = "forecast_history.csv"
+HISTORY_FILE = "/tmp/forecast_history.csv"  # 🔧 Save to /tmp for Render compatibility
+FORECAST_FILE = "/tmp/forecast_results.xlsx"  # 🔧 Also save forecast file in /tmp
 
 
 # ---------- Helper: Load or train model ----------
@@ -60,6 +61,9 @@ model = load_or_train_model()
 @app.route('/api/revenue/forecast', methods=['POST'])
 def generate_forecast():
     try:
+        print("🟢 /api/revenue/forecast called")  # 🔧 Helps debug live logs
+        _ = request.get_json(silent=True)  # 🔧 Safely parse body (even if empty)
+
         if not os.path.exists(DATA_FILE):
             return jsonify({"status": "error", "message": "Data file not found."}), 404
 
@@ -94,7 +98,9 @@ def generate_forecast():
 
         # --- Save forecast results ---
         forecast_df.to_csv(HISTORY_FILE, index=False)
-        forecast_df.to_excel("forecast_results.xlsx", index=False)
+        forecast_df.to_excel(FORECAST_FILE, index=False)
+
+        print("✅ Forecast generated successfully with", len(forecast_df), "rows")
 
         return jsonify({
             "status": "success",
@@ -112,6 +118,7 @@ def get_forecast_history():
     try:
         if not os.path.exists(HISTORY_FILE):
             return jsonify([])
+
         df = pd.read_csv(HISTORY_FILE)
         return jsonify(df.to_dict(orient="records"))
     except Exception as e:
@@ -123,10 +130,10 @@ def get_forecast_history():
 @app.route("/api/revenue/download", methods=["GET"])
 def download_forecast():
     try:
-        if not os.path.exists("forecast_results.xlsx"):
+        if not os.path.exists(FORECAST_FILE):
             return jsonify({"status": "error", "message": "No forecast file found"}), 404
 
-        return send_file("forecast_results.xlsx", as_attachment=True)
+        return send_file(FORECAST_FILE, as_attachment=True)
     except Exception as e:
         print("❌ Download error:", e)
         return jsonify({"status": "error", "message": str(e)}), 500
