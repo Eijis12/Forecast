@@ -8,14 +8,13 @@ import traceback
 import os
 
 app = Flask(__name__)
-
-# ✅ Allow your frontend origin
 CORS(app, resources={r"/*": {"origins": ["https://campbelldentalsystem.site", "*"]}})
 
 EXCEL_PATH = "DentalRecords_RevenueForecasting.xlsx"
 
+
 # ==========================================================
-# Helper: Generate Forecast
+# Forecast generation
 # ==========================================================
 def generate_forecast():
     if not os.path.exists(EXCEL_PATH):
@@ -28,22 +27,40 @@ def generate_forecast():
     if not required.issubset(df.columns):
         raise ValueError(f"Excel must contain columns: {required}. Found: {df.columns.tolist()}")
 
-    # ✅ Force numeric conversion
+    # === Safe numeric conversion ===
     for col in ["YEAR", "MONTH", "DAY", "AMOUNT"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # ✅ Create Date
+    # === Fill missing values gracefully ===
+    for col in ["YEAR", "MONTH", "DAY"]:
+        if df[col].isna().any():
+            mode_val = df[col].mode().iloc[0] if not df[col].mode().empty else 1
+            df[col] = df[col].fillna(mode_val)
+
+    if df["AMOUNT"].isna().any():
+        df["AMOUNT"] = df["AMOUNT"].fillna(df["AMOUNT"].mean())
+
+    # === Create date safely ===
     df["Date"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]], errors="coerce")
+
+    # If still NaT, fill sequentially
+    if df["Date"].isna().any():
+        start_date = pd.Timestamp("2020-01-01")
+        df.loc[df["Date"].isna(), "Date"] = [
+            start_date + pd.Timedelta(days=i) for i in range(df["Date"].isna().sum())
+        ]
+
     df["Revenue"] = df["AMOUNT"]
 
-    # ✅ Drop only invalid rows
-    df = df.dropna(subset=["Date", "Revenue"])
+    df = df.dropna(subset=["Revenue"])
     df = df.sort_values("Date")
 
     if df.empty:
-        raise ValueError("No valid data rows found after cleaning. Please check YEAR, MONTH, DAY, and AMOUNT columns.")
+        raise ValueError(
+            "No valid data rows found even after fixing. Please check that your file has numeric YEAR, MONTH, DAY, and AMOUNT values."
+        )
 
-    # ✅ Features
+    # === Feature engineering ===
     df["Year"] = df["Date"].dt.year
     df["Month"] = df["Date"].dt.month
     df["Day"] = df["Date"].dt.day
@@ -52,14 +69,11 @@ def generate_forecast():
     X = df[["Year", "Month", "Day", "DayOfWeek"]]
     y = df["Revenue"]
 
-    if X.empty or y.empty:
-        raise ValueError("Training data is empty — check Excel content.")
-
-    # ✅ Train model
+    # === Train LightGBM ===
     model = lgb.LGBMRegressor(objective="regression", n_estimators=120, learning_rate=0.1)
     model.fit(X, y)
 
-    # ✅ Forecast next 12 months
+    # === Predict next 12 months ===
     last_date = df["Date"].max()
     future_dates = [last_date + pd.DateOffset(months=i) for i in range(1, 13)]
 
@@ -70,7 +84,6 @@ def generate_forecast():
         "Day": [d.day for d in future_dates],
         "DayOfWeek": [d.dayofweek for d in future_dates],
     })
-
     future_df["Forecasted_Revenue"] = model.predict(future_df[["Year", "Month", "Day", "DayOfWeek"]])
 
     forecast_result = {
@@ -85,7 +98,7 @@ def generate_forecast():
 
 
 # ==========================================================
-# Routes
+# API routes
 # ==========================================================
 @app.route("/")
 def home():
@@ -100,7 +113,6 @@ def forecast_revenue():
 
         result = generate_forecast()
         return jsonify({"status": "success", "data": result}), 200
-
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -141,8 +153,5 @@ def download_forecast():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ==========================================================
-# Run app
-# ==========================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
