@@ -9,7 +9,7 @@ import os
 
 app = Flask(__name__)
 
-# ✅ Allow your admin dashboard to call this API
+# ✅ Allow your frontend origin
 CORS(app, resources={r"/*": {"origins": ["https://campbelldentalsystem.site", "*"]}})
 
 EXCEL_PATH = "DentalRecords_RevenueForecasting.xlsx"
@@ -21,33 +21,45 @@ def generate_forecast():
     if not os.path.exists(EXCEL_PATH):
         raise FileNotFoundError(f"Excel file not found: {EXCEL_PATH}")
 
-    # Load Excel
     df = pd.read_excel(EXCEL_PATH)
     df.columns = [c.strip().upper() for c in df.columns]
 
-    # ✅ Validate expected columns
     required = {"YEAR", "MONTH", "DAY", "AMOUNT"}
     if not required.issubset(df.columns):
         raise ValueError(f"Excel must contain columns: {required}. Found: {df.columns.tolist()}")
 
-    # ✅ Combine YEAR, MONTH, DAY → single Date
-    df["Date"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]], errors="coerce")
-    df["Revenue"] = pd.to_numeric(df["AMOUNT"], errors="coerce")
-    df = df.dropna(subset=["Date", "Revenue"]).sort_values("Date")
+    # ✅ Force numeric conversion
+    for col in ["YEAR", "MONTH", "DAY", "AMOUNT"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # ✅ Feature engineering
+    # ✅ Create Date
+    df["Date"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]], errors="coerce")
+    df["Revenue"] = df["AMOUNT"]
+
+    # ✅ Drop only invalid rows
+    df = df.dropna(subset=["Date", "Revenue"])
+    df = df.sort_values("Date")
+
+    if df.empty:
+        raise ValueError("No valid data rows found after cleaning. Please check YEAR, MONTH, DAY, and AMOUNT columns.")
+
+    # ✅ Features
     df["Year"] = df["Date"].dt.year
     df["Month"] = df["Date"].dt.month
     df["Day"] = df["Date"].dt.day
     df["DayOfWeek"] = df["Date"].dt.dayofweek
 
-    # ✅ Train model
     X = df[["Year", "Month", "Day", "DayOfWeek"]]
     y = df["Revenue"]
+
+    if X.empty or y.empty:
+        raise ValueError("Training data is empty — check Excel content.")
+
+    # ✅ Train model
     model = lgb.LGBMRegressor(objective="regression", n_estimators=120, learning_rate=0.1)
     model.fit(X, y)
 
-    # ✅ Forecast for next 12 months (month-end)
+    # ✅ Forecast next 12 months
     last_date = df["Date"].max()
     future_dates = [last_date + pd.DateOffset(months=i) for i in range(1, 13)]
 
@@ -58,9 +70,9 @@ def generate_forecast():
         "Day": [d.day for d in future_dates],
         "DayOfWeek": [d.dayofweek for d in future_dates],
     })
+
     future_df["Forecasted_Revenue"] = model.predict(future_df[["Year", "Month", "Day", "DayOfWeek"]])
 
-    # ✅ Combine with accuracy estimation (mock 95–99%)
     forecast_result = {
         "daily_forecast": {
             str(d.date()): round(r, 2)
@@ -100,7 +112,6 @@ def get_history():
         if request.method == "OPTIONS":
             return jsonify({"status": "ok"}), 200
 
-        # Mocked history table for frontend (can extend later)
         data = [
             {"Date": "2025-08-01", "Forecasted_Revenue": 150000, "Accuracy": 97.5},
             {"Date": "2025-09-01", "Forecasted_Revenue": 152500, "Accuracy": 98.1},
