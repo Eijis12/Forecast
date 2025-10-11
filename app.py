@@ -73,17 +73,18 @@ def generate_forecast():
     model = lgb.LGBMRegressor(objective="regression", n_estimators=120, learning_rate=0.1)
     model.fit(X, y)
 
-# === Predict next 30 days starting from today ===
-start_date = pd.Timestamp.today().normalize()
-future_dates = [start_date + pd.Timedelta(days=i) for i in range(1, 31)]
+    # === Predict next 30 days starting from today ===
+    start_date = pd.Timestamp.today().normalize()
+    future_dates = [start_date + pd.Timedelta(days=i) for i in range(1, 31)]
 
-future_df = pd.DataFrame({
+    future_df = pd.DataFrame({
         "Date": future_dates,
         "Year": [d.year for d in future_dates],
         "Month": [d.month for d in future_dates],
         "Day": [d.day for d in future_dates],
         "DayOfWeek": [d.dayofweek for d in future_dates],
     })
+
     future_df["Forecasted_Revenue"] = model.predict(future_df[["Year", "Month", "Day", "DayOfWeek"]])
 
     forecast_result = {
@@ -155,5 +156,3 @@ def download_forecast():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
-
