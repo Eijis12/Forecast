@@ -6,19 +6,11 @@ import datetime
 import lightgbm as lgb
 import traceback
 import os
-from lightgbm import LGBMRegressor
 
 app = Flask(__name__)
 
-# --- Enable CORS properly for API routes ---
-CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
-
-@app.after_request
-def after_request(response):
-    response.headers.add("Access-Control-Allow-Origin", "*")
-    response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
-    response.headers.add("Access-Control-Allow-Methods", "GET,PUT,POST,DELETE,OPTIONS")
-    return response
+# ✅ Allow only your site (this fixes the multiple header issue)
+CORS(app, resources={r"/api/*": {"origins": "https://campbelldentalsystem.site"}})
 
 # --- Helper: parse month safely ---
 def parse_month(value):
@@ -37,6 +29,7 @@ def parse_month(value):
         return m.month
     except Exception:
         return np.nan
+
 
 # --- Forecast Route ---
 @app.route("/api/revenue/forecast", methods=["POST", "OPTIONS"])
@@ -97,6 +90,7 @@ def forecast_revenue():
             "message": str(e),
             "trace": traceback.format_exc()
         }), 500
+
 
 # --- Root route for Render test ---
 @app.route("/", methods=["GET"])
