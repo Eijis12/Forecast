@@ -77,7 +77,7 @@ def generate_forecast():
 start_date = pd.Timestamp.today().normalize()
 future_dates = [start_date + pd.Timedelta(days=i) for i in range(1, 31)]
 
-    future_df = pd.DataFrame({
+future_df = pd.DataFrame({
         "Date": future_dates,
         "Year": [d.year for d in future_dates],
         "Month": [d.month for d in future_dates],
@@ -155,4 +155,5 @@ def download_forecast():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
 
