@@ -4,16 +4,14 @@ import pandas as pd
 import numpy as np
 import lightgbm as lgb
 import io
-import traceback
 import os
-from datetime import datetime
+import traceback
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ["https://campbelldentalsystem.site", "*"]}})
 
 EXCEL_PATH = "DentalRecords_RevenueForecasting.xlsx"
-HISTORY_PATH = "forecast_history.csv"  # <-- file to store forecast history
-
+HISTORY_PATH = "forecast_history.csv"
 
 # ==========================================================
 # Forecast generation
@@ -24,8 +22,8 @@ def generate_forecast():
 
     df = pd.read_excel(EXCEL_PATH)
     df.columns = [c.strip().upper() for c in df.columns]
-
     required = {"YEAR", "MONTH", "DAY", "AMOUNT"}
+
     if not required.issubset(df.columns):
         raise ValueError(f"Excel must contain columns: {required}. Found: {df.columns.tolist()}")
 
@@ -41,14 +39,8 @@ def generate_forecast():
         df["AMOUNT"] = df["AMOUNT"].fillna(df["AMOUNT"].mean())
 
     df["Date"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]], errors="coerce")
-    if df["Date"].isna().any():
-        start_date = pd.Timestamp("2020-01-01")
-        df.loc[df["Date"].isna(), "Date"] = [
-            start_date + pd.Timedelta(days=i) for i in range(df["Date"].isna().sum())
-        ]
-
+    df["Date"] = df["Date"].fillna(pd.Timestamp("2020-01-01"))
     df["Revenue"] = df["AMOUNT"]
-    df = df.dropna(subset=["Revenue"])
     df = df.sort_values("Date")
 
     df["Year"] = df["Date"].dt.year
@@ -62,6 +54,7 @@ def generate_forecast():
     model = lgb.LGBMRegressor(objective="regression", n_estimators=120, learning_rate=0.1)
     model.fit(X, y)
 
+    # Predict next 30 days from today
     start_date = pd.Timestamp.today().normalize()
     future_dates = [start_date + pd.Timedelta(days=i) for i in range(1, 31)]
 
@@ -72,44 +65,39 @@ def generate_forecast():
         "Day": [d.day for d in future_dates],
         "DayOfWeek": [d.dayofweek for d in future_dates],
     })
-
     future_df["Forecasted_Revenue"] = model.predict(future_df[["Year", "Month", "Day", "DayOfWeek"]])
     accuracy = round(np.random.uniform(95, 99), 2)
 
-    # Save forecast to history file
-    save_forecast_history(future_df, accuracy)
+    # Save forecast to history
+    forecast_data = pd.DataFrame({
+        "Date": future_df["Date"].dt.strftime("%Y-%m-%d"),
+        "Forecasted_Revenue": future_df["Forecasted_Revenue"].round(2),
+        "Accuracy": accuracy
+    })
+    save_forecast_history(forecast_data)
 
-    forecast_result = {
-        "daily_forecast": {
-            str(d.date()): round(r, 2)
-            for d, r in zip(future_df["Date"], future_df["Forecasted_Revenue"])
-        },
-        "accuracy": accuracy,
+    return {
+        "daily_forecast": dict(zip(forecast_data["Date"], forecast_data["Forecasted_Revenue"])),
+        "accuracy": accuracy
     }
 
-    return forecast_result
-
-
 # ==========================================================
-# Save Forecast History
+# Save & Load History
 # ==========================================================
-def save_forecast_history(future_df, accuracy):
-    try:
-        record_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        df_to_save = future_df.copy()
-        df_to_save["Accuracy"] = accuracy
-        df_to_save["Generated_At"] = record_time
+def save_forecast_history(new_data):
+    """Append new forecast results to forecast_history.csv"""
+    if os.path.exists(HISTORY_PATH):
+        old_data = pd.read_csv(HISTORY_PATH)
+        combined = pd.concat([old_data, new_data]).drop_duplicates(subset=["Date"], keep="last")
+    else:
+        combined = new_data
+    combined.to_csv(HISTORY_PATH, index=False)
 
-        if os.path.exists(HISTORY_PATH):
-            existing = pd.read_csv(HISTORY_PATH)
-            combined = pd.concat([existing, df_to_save], ignore_index=True)
-        else:
-            combined = df_to_save
-
-        combined.to_csv(HISTORY_PATH, index=False)
-    except Exception as e:
-        print("Error saving forecast history:", e)
-
+def load_forecast_history():
+    """Load forecast history if exists"""
+    if not os.path.exists(HISTORY_PATH):
+        return pd.DataFrame(columns=["Date", "Forecasted_Revenue", "Accuracy"])
+    return pd.read_csv(HISTORY_PATH)
 
 # ==========================================================
 # API routes
@@ -118,81 +106,41 @@ def save_forecast_history(future_df, accuracy):
 def home():
     return jsonify({"message": "Revenue Forecast API active"})
 
-
 @app.route("/api/revenue/forecast", methods=["POST", "OPTIONS"])
 def forecast_revenue():
     try:
         if request.method == "OPTIONS":
             return jsonify({"status": "ok"}), 200
-
         result = generate_forecast()
         return jsonify({"status": "success", "data": result}), 200
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
-
-@app.route("/api/revenue/history", methods=["GET", "OPTIONS"])
+@app.route("/api/revenue/history", methods=["GET"])
 def get_history():
     try:
-        if request.method == "OPTIONS":
-            return jsonify({"status": "ok"}), 200
-
-        if not os.path.exists(HISTORY_PATH):
-            return jsonify({"status": "success", "data": []}), 200
-
-        df = pd.read_csv(HISTORY_PATH)
-        df = df.sort_values("Date", ascending=False)
-
-        # Return only latest 10 forecasts for clarity
-        latest = df.tail(10)[["Date", "Forecasted_Revenue", "Accuracy", "Generated_At"]]
-
-        data = latest.to_dict(orient="records")
-        return jsonify({"status": "success", "data": data}), 200
+        df = load_forecast_history()
+        data = df.to_dict(orient="records")
+        return jsonify(data)
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
-
 
 @app.route("/api/revenue/download", methods=["GET"])
 def download_forecast():
     try:
-        # Generate latest forecast
-        result = generate_forecast()
-        forecast_df = pd.DataFrame(list(result["daily_forecast"].items()), columns=["Date", "Forecasted_Revenue"])
-        forecast_df["Accuracy"] = result["accuracy"]
-
-        # === Append to forecast history ===
-        history_path = "forecast_history.csv"
-        if os.path.exists(history_path):
-            history_df = pd.read_csv(history_path)
-            combined_df = pd.concat([history_df, forecast_df], ignore_index=True)
-        else:
-            combined_df = forecast_df
-
-        # Save combined history
-        combined_df.to_csv(history_path, index=False)
-
-        # === Generate downloadable Excel file ===
+        df = load_forecast_history()
+        if df.empty:
+            return jsonify({"status": "error", "message": "No forecast data to download"}), 404
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            forecast_df.to_excel(writer, index=False, sheet_name="Latest_Forecast")
-            combined_df.to_excel(writer, index=False, sheet_name="Forecast_History")
+            df.to_excel(writer, index=False, sheet_name="Forecast_History")
         output.seek(0)
-
-        return send_file(
-            output,
-            as_attachment=True,
-            download_name="RevenueForecast_History.xlsx",
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
+        return send_file(output, as_attachment=True, download_name="Forecast_History.xlsx")
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
-
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
