@@ -60,7 +60,7 @@ model = load_or_train_model()
 # ============================================================
 # ✅ Forecast Route (POST + GET for debugging + OPTIONS)
 # ============================================================
-@app.route('/api/revenue/forecast', methods=['POST', 'GET', 'OPTIONS'])
+@app.route('/api/revenue/forecast', methods=['POST'])
 def generate_forecast():
     # --- Handle CORS preflight ---
     if request.method == "OPTIONS":
@@ -181,3 +181,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"🚀 Server starting on port {port}")
     app.run(host="0.0.0.0", port=port)
+
