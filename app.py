@@ -31,7 +31,6 @@ def safe_float(x, fallback=0.0):
         # if it's a numpy scalar
         if isinstance(x, (np.floating, np.integer)):
             x = x.item()
-        # if it's pandas Timestamp or similar, not relevant here
         f = float(x)
         if math.isfinite(f):
             return f
@@ -54,68 +53,56 @@ def generate_forecast():
     # Read excel
     df = pd.read_excel(EXCEL_PATH)
 
-    # Normalize column names (upper, stripped)
+    # Normalize column names
     df.columns = [c.strip().upper() for c in df.columns]
 
-    # Accept either "REVENUE" or "AMOUNT" as revenue column. Prefer REVENUE if present.
+    # Accept either REVENUE or AMOUNT as column
     if "REVENUE" in df.columns:
         df = df.rename(columns={"REVENUE": "AMOUNT"})
-    # Now require YEAR, MONTH, DAY, AMOUNT
     required = {"YEAR", "MONTH", "DAY", "AMOUNT"}
     if not required.issubset(set(df.columns)):
         raise ValueError(f"Excel file must have columns: {required}. Found: {df.columns.tolist()}")
 
-    # Convert numeric columns safely
     for col in ["YEAR", "MONTH", "DAY", "AMOUNT"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Create date column (if DATE present, prefer it)
+    # Create date column
     if "DATE" in df.columns:
-        # try parsing DATE column if exists (some sheets include)
         df["DATE_PARSED"] = pd.to_datetime(df["DATE"], errors="coerce")
-        # if any valid parsed date found, use it
         if df["DATE_PARSED"].notna().any():
             df["DATE"] = df["DATE_PARSED"]
-    # If no DATE or parsing failed, build from YEAR/MONTH/DAY
     if "DATE" not in df.columns or df["DATE"].isna().all():
         df["DATE"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]], errors="coerce")
 
-    # Fill small number of missing dates by forward fill/backfill - safe fallback
     if df["DATE"].isna().any():
         df["DATE"] = df["DATE"].fillna(method="ffill").fillna(method="bfill")
 
-    # Revenue column
     df["REVENUE_VAL"] = pd.to_numeric(df["AMOUNT"], errors="coerce")
     if df["REVENUE_VAL"].isna().all():
         raise ValueError("Revenue column contains no numeric values.")
 
-    # Remove rows without a valid date or revenue
     df = df.dropna(subset=["DATE", "REVENUE_VAL"]).copy()
     df = df.sort_values("DATE").reset_index(drop=True)
-
     if df.empty:
         raise ValueError("No valid data rows found after cleaning.")
 
-    # Feature engineering for modelling
     df["YEAR"] = df["DATE"].dt.year
     df["MONTH"] = df["DATE"].dt.month
     df["DAY"] = df["DATE"].dt.day
-    df["DOW"] = df["DATE"].dt.dayofweek  # Monday=0 ... Sunday=6
+    df["DOW"] = df["DATE"].dt.dayofweek
     df["IS_WEEKEND"] = df["DOW"].isin([5, 6]).astype(int)
-    # Additional features could be added (holidays, payday flag) if available
 
-    # --- 1) Exponential Smoothing forecast (baseline) ---
+    # 1. Exponential Smoothing
     try:
         es_model = ExponentialSmoothing(df["REVENUE_VAL"], trend="add", seasonal=None)
         es_fit = es_model.fit(optimized=True)
         es_forecast = es_fit.forecast(30)
         es_fitted = es_fit.fittedvalues
     except Exception:
-        # safe fallback to simple mean forecast
         es_forecast = pd.Series(np.repeat(df["REVENUE_VAL"].mean(), 30))
         es_fitted = pd.Series(np.repeat(df["REVENUE_VAL"].mean(), len(df)))
 
-    # --- 2) Prophet forecast ---
+    # 2. Prophet
     try:
         prophet_df = df[["DATE", "REVENUE_VAL"]].rename(columns={"DATE": "ds", "REVENUE_VAL": "y"})
         prophet_model = Prophet(daily_seasonality=True)
@@ -126,14 +113,13 @@ def generate_forecast():
     except Exception:
         prophet_forecast = np.repeat(df["REVENUE_VAL"].mean(), 30)
 
-    # --- 3) LightGBM on date features (learn seasonality/structure) ---
+    # 3. LightGBM
     try:
         lgb_features = ["YEAR", "MONTH", "DAY", "DOW"]
         X = df[lgb_features]
         y = df["REVENUE_VAL"]
         lgb_model = lgb.LGBMRegressor(objective="regression", n_estimators=200, learning_rate=0.05)
         lgb_model.fit(X, y)
-        # Prepare future features
         start_date = pd.Timestamp.today().normalize()
         future_dates = [start_date + pd.Timedelta(days=i) for i in range(1, 31)]
         future_df = pd.DataFrame({"DATE": future_dates})
@@ -143,13 +129,10 @@ def generate_forecast():
         future_df["DOW"] = future_df["DATE"].dt.dayofweek
         lgb_forecast = lgb_model.predict(future_df[["YEAR", "MONTH", "DAY", "DOW"]])
     except Exception:
-        # fallback
         future_dates = [pd.Timestamp.today().normalize() + pd.Timedelta(days=i) for i in range(1, 31)]
         lgb_forecast = np.repeat(df["REVENUE_VAL"].mean(), 30)
 
-    # --- 4) Combine (simple weighted average) ---
-    # Using weights that can be tuned; chosen to be robust defaults
-    # If any component has NaNs, replace with mean
+    # 4. Combine
     def fix_array(arr):
         arr = np.array(arr, dtype=float)
         if np.isnan(arr).any():
@@ -159,104 +142,60 @@ def generate_forecast():
     exp_arr = fix_array(es_forecast)
     prop_arr = fix_array(prophet_forecast)
     lgb_arr = fix_array(lgb_forecast)
-
     combined = 0.30 * exp_arr + 0.30 * prop_arr + 0.40 * lgb_arr
 
-    # --- 5) Residual correction LightGBM (optional, lightweight) ---
-    # We'll train a small residual model if there is enough history
+    # 5. Residual correction
     try:
-        # Build residuals on historical data using the same hybrid logic for historical in-sample
-        # Create historical hybrid forecast in-sample using a rolling approach would be ideal,
-        # but to keep simple and robust for production: use fitted ES + prophet in-sample if available
-        in_sample_hybrid = None
-        # try to compute prophet in-sample predictions (if prophet fit earlier)
         try:
             pred_full = prophet_model.predict(prophet_df)
             prop_insample = pred_full["yhat"].values
         except Exception:
             prop_insample = np.repeat(df["REVENUE_VAL"].mean(), len(df))
-
         try:
             es_insample = es_fitted.values if hasattr(es_fitted, "values") else np.repeat(df["REVENUE_VAL"].mean(), len(df))
         except Exception:
             es_insample = np.repeat(df["REVENUE_VAL"].mean(), len(df))
-
-        # Build a simple in-sample hybrid
         in_sample_hybrid = 0.3 * np.array(es_insample) + 0.3 * np.array(prop_insample)
-        # residual
         residuals = df["REVENUE_VAL"].values - in_sample_hybrid
-
-        # Features for residual model
         df_resid = df.copy()
         df_resid["resid"] = residuals
         resid_features = ["DOW", "MONTH", "DAY", "IS_WEEKEND"]
-        # if not enough unique data, skip
         if df_resid.shape[0] >= 60:
             resid_X = df_resid[resid_features]
             resid_y = df_resid["resid"]
             resid_model = lgb.LGBMRegressor(n_estimators=200, learning_rate=0.05)
             resid_model.fit(resid_X, resid_y)
-            # predict residuals for future_df
-            resid_pred_future = resid_model.predict(future_df.assign(IS_WEEKEND=future_df["DOW"].isin([5,6]).astype(int))[resid_features])
-            # correct combined forecast
+            resid_pred_future = resid_model.predict(future_df.assign(IS_WEEKEND=future_df["DOW"].isin([5, 6]).astype(int))[resid_features])
             combined = combined + resid_pred_future
-        else:
-            # skip residual correction for small datasets
-            pass
     except Exception:
-        # If anything fails, continue with combined as-is
         pass
 
-    # --- 6) Sunday closed rule (your dataset uses Sundays = 0) ---
-    # pandas dayofweek: Sunday = 6
+    # 6. Sunday rule
     combined_corrected = []
     for d, val in zip(future_dates, combined):
-        dow = d.dayofweek
-        if dow == 6:
+        if d.dayofweek == 6:
             combined_corrected.append(0.0)
         else:
             combined_corrected.append(float(safe_float(val, 0.0)))
 
-    # --- 7) Build response data structure (chart_data & daily_forecast) ---
-    # Historical chart_data: use the cleaned history
-    chart_rows = []
-    for _, r in df.iterrows():
-        chart_rows.append({
-            "date": str(r["DATE"].date()),
-            "revenue": safe_float(r["REVENUE_VAL"], 0.0),
-            "type": "historical"
-        })
+    # 7. Chart data
+    chart_rows = [{"date": str(r["DATE"].date()), "revenue": safe_float(r["REVENUE_VAL"], 0.0), "type": "historical"} for _, r in df.iterrows()]
+    chart_rows += [{"date": str(pd.Timestamp(d).date()), "revenue": safe_float(v, 0.0), "type": "forecast"} for d, v in zip(future_dates, combined_corrected)]
+    daily_forecast = {str(pd.Timestamp(d).date()): safe_float(v, 0.0) for d, v in zip(future_dates, combined_corrected)}
 
-    # Future chart points
-    for d, v in zip(future_dates, combined_corrected):
-        chart_rows.append({
-            "date": str(pd.Timestamp(d).date()),
-            "revenue": safe_float(v, 0.0),
-            "type": "forecast"
-        })
-
-    # daily_forecast mapping (date string -> numeric)
-    daily_forecast = { str(pd.Timestamp(d).date()): safe_float(v, 0.0) for d, v in zip(future_dates, combined_corrected) }
-
-    # --- 8) Metrics: MAE (compute on last N days in-sample vs ES fitted or other baseline)
-    # We'll compute MAE between the last up-to-30 historical days and ES fitted if available,
-    # then multiply by 30 to present as monthly MAE (your request).
+    # 8. MAE calculation (×30 monthly)
     mae_val = None
     try:
-        # choose in-sample predicted series to compare with actual last 30 days (prefer ES fitted if present)
-        insample_pred_source = None
         if 'es_fitted' in locals() and hasattr(es_fitted, "__len__"):
             insample_pred_source = np.array(es_fitted[-30:]) if len(es_fitted) >= 1 else None
         if insample_pred_source is None or len(insample_pred_source) < 1:
             insample_pred_source = np.repeat(df["REVENUE_VAL"].mean(), min(30, len(df)))
-
         actual_last = np.array(df["REVENUE_VAL"].values[-30:]) if len(df) >= 1 else np.array([])
-        # If length mismatch, trim/pad
         n = min(len(actual_last), len(insample_pred_source))
         if n > 0:
             mae_sample = mean_absolute_error(actual_last[-n:], insample_pred_source[-n:])
             mae_val = float(mae_sample)
-            mae_monthly = float(round(mae_val * 30.0, 2))  # per-month MAE
+            mae_monthly = float(round(mae_val * 30.0, 2))
         else:
             mae_val = None
             mae_monthly = None
@@ -265,7 +204,6 @@ def generate_forecast():
         mae_monthly = None
 
     total_forecast = float(round(sum(combined_corrected), 2))
-
     result = {
         "chart_data": chart_rows,
         "daily_forecast": daily_forecast,
@@ -274,9 +212,6 @@ def generate_forecast():
         "mae_monthly": mae_monthly
     }
 
-    # Ensure everything is JSON-friendly (no np.nan, np.float64 etc.)
-    # Convert any possible numpy types to python built-ins
-    # (We've already sanitized most values, but we do a final pass)
     def sanitize(obj):
         if isinstance(obj, dict):
             return {k: sanitize(v) for k, v in obj.items()}
@@ -299,7 +234,7 @@ def generate_forecast():
 
 
 # --------------------------
-# Validation route (optional)
+# Validation route
 # --------------------------
 @app.route("/api/revenue/validate", methods=["POST"])
 def validate_forecast():
@@ -309,7 +244,6 @@ def validate_forecast():
         predicted = payload.get("predicted", [])
         if not isinstance(actual, list) or not isinstance(predicted, list) or len(actual) == 0 or len(predicted) == 0:
             return jsonify({"status": "error", "message": "Please provide arrays 'actual' and 'predicted'"}), 400
-        # align lengths
         n = min(len(actual), len(predicted))
         actual_arr = np.array(actual[:n], dtype=float)
         pred_arr = np.array(predicted[:n], dtype=float)
@@ -334,10 +268,16 @@ def forecast_revenue():
         if request.method == "OPTIONS":
             return jsonify({"status": "ok"}), 200
         result = generate_forecast()
-        return jsonify({"status": "success", "data": result}), 200
+        # ✅ merge mae_monthly for frontend compatibility
+        response = {
+            "status": "success",
+            "data": result
+        }
+        if result.get("mae_monthly") is not None:
+            response["data"]["mae"] = result["mae_monthly"]
+        return jsonify(response), 200
     except Exception as e:
         traceback.print_exc()
-        # Return error message but keep JSON safe
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -346,7 +286,6 @@ def get_history():
     try:
         if request.method == "OPTIONS":
             return jsonify({"status": "ok"}), 200
-        # currently no saved history storage; return empty list to frontend
         return jsonify({"status": "success", "data": []}), 200
     except Exception as e:
         traceback.print_exc()
@@ -358,7 +297,6 @@ def download_forecast():
     try:
         result = generate_forecast()
         df_out = pd.DataFrame(list(result["daily_forecast"].items()), columns=["Date", "Forecasted_Revenue"])
-        # Add summary row
         df_out.loc[len(df_out)] = ["Total (₱)", result.get("total_forecast", 0.0)]
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
@@ -371,7 +309,7 @@ def download_forecast():
 
 
 # --------------------------
-# Run (development mode)
+# Run
 # --------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
