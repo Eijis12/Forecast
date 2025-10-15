@@ -17,16 +17,20 @@ EXCEL_PATH = "Dental_Revenue_2425.xlsx"
 # Utility Functions
 # --------------------------
 def safe_float(x):
-    """Ensure value is finite float."""
+    """Convert safely without killing valid numeric values."""
     try:
+        if isinstance(x, (np.floating, np.integer)):
+            return float(x)
         f = float(x)
-        return f if math.isfinite(f) else 0.0
-    except:
+        if not math.isfinite(f):
+            return 0.0
+        return f
+    except Exception:
         return 0.0
 
 
 # --------------------------
-# Core Forecast Function
+# Forecast Function
 # --------------------------
 def generate_forecast():
     if not os.path.exists(EXCEL_PATH):
@@ -51,13 +55,10 @@ def generate_forecast():
 
     df.dropna(subset=["DATE"], inplace=True)
     df = df.sort_values("DATE").reset_index(drop=True)
-
-    # Ensure numeric revenue
     df[revenue_col] = pd.to_numeric(df[revenue_col], errors="coerce")
     df = df.dropna(subset=[revenue_col])
 
-    if df[revenue_col].max() < 1000:
-        print("⚠️ Warning: Revenue values are unusually low — check dataset scale.")
+    print(f"✅ Loaded {len(df)} rows | Revenue sample:", df[revenue_col].head(5).tolist())
 
     # ------------------------------
     # Feature Engineering
@@ -87,7 +88,7 @@ def generate_forecast():
     prophet_forecast = prophet_pred.tail(30)["yhat"].values
 
     # ------------------------------
-    # LightGBM Baseline
+    # LightGBM Forecast
     # ------------------------------
     features = ["day_of_week", "is_weekend", "month"]
     X = df[features]
@@ -108,7 +109,7 @@ def generate_forecast():
     lgb_forecast = lgb_model.predict(future_df[features])
 
     # ------------------------------
-    # Hybrid (Prophet + ES + LGBM)
+    # Hybrid Combination
     # ------------------------------
     df["Hybrid_forecast"] = 0.3 * df["ES_fitted"] + 0.3 * df["Prophet_fitted"] + 0.4 * df[revenue_col]
     future_df["Hybrid_future_forecast"] = (
@@ -123,15 +124,10 @@ def generate_forecast():
 
     resid_features = ["day_of_week", "is_weekend", "is_payday", "month", "is_holiday"]
     resid_model = lgb.LGBMRegressor(
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=6,
-        num_leaves=31,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42
+        n_estimators=300, learning_rate=0.05, random_state=42
     )
     resid_model.fit(df[resid_features], df["Residual"])
+
     df["Residual_pred"] = resid_model.predict(df[resid_features])
     df["Hybrid_corrected"] = df["Hybrid_forecast"] + df["Residual_pred"]
 
@@ -140,11 +136,17 @@ def generate_forecast():
         future_df["Hybrid_future_forecast"] + future_df["Residual_pred"]
     )
 
-    # Sundays = 0 (clinic closed)
-    future_df.loc[future_df["day_of_week"] == 6, "Hybrid_future_corrected"] = 0.0
+    # Sundays = 0
+    sunday_mask = future_df["day_of_week"] == 6
+    future_df.loc[sunday_mask, "Hybrid_future_corrected"] = 0.0
 
     # ------------------------------
-    # MAE Computation (per-day & per-month)
+    # Validate Non-Zero Forecasts
+    # ------------------------------
+    print("🔎 Future Forecast (first 5 values):", future_df["Hybrid_future_corrected"].head(5).tolist())
+
+    # ------------------------------
+    # MAE
     # ------------------------------
     actual = df["y_smooth"].values
     predicted = df["Hybrid_corrected"].values
@@ -152,7 +154,7 @@ def generate_forecast():
     mae_monthly = round(mae * 30, 2)
 
     # ------------------------------
-    # Prepare Response
+    # Response
     # ------------------------------
     daily_forecast = {
         str(d.date()): safe_float(v)
