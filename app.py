@@ -8,12 +8,12 @@ import traceback
 import os
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from sklearn.metrics import mean_absolute_error
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ["https://campbelldentalsystem.site", "*"]}})
 
 EXCEL_PATH = "Dental_Revenue_2425.xlsx"
-
 
 # ==========================================================
 # Forecast generation
@@ -102,8 +102,13 @@ def generate_forecast():
 
     combined_df = pd.concat([hist_df, future_df], ignore_index=True)
 
+    # === Metrics (MAE only) ===
+    try:
+        mae = mean_absolute_error(df["Revenue"].iloc[-30:], exp_fit.fittedvalues[-30:])
+    except Exception:
+        mae = float("nan")
+
     total_forecast = np.sum(combined_forecast)
-    accuracy = round(np.random.uniform(95, 99), 2)
 
     forecast_result = {
         "chart_data": [
@@ -115,46 +120,17 @@ def generate_forecast():
             for d, r in zip(future_dates, combined_forecast)
         },
         "total_forecast": round(total_forecast, 2),
-        "accuracy": accuracy,
+        "mae": round(mae, 2) if not np.isnan(mae) else None,
     }
 
     return forecast_result
 
-
 # ==========================================================
-# Accuracy validation (MAPE)
-# ==========================================================
-def calculate_mape(actual, predicted):
-    actual, predicted = np.array(actual), np.array(predicted)
-    mask = actual != 0
-    if not np.any(mask):
-        return None
-    mape = np.mean(np.abs((actual[mask] - predicted[mask]) / actual[mask])) * 100
-    return round(100 - mape, 2)
-
-
-@app.route("/api/revenue/validate", methods=["POST"])
-def validate_forecast():
-    try:
-        data = request.json
-        actual = data.get("actual")
-        predicted = data.get("predicted")
-        if not actual or not predicted:
-            return jsonify({"status": "error", "message": "Missing actual or predicted values"}), 400
-        accuracy = calculate_mape(actual, predicted)
-        return jsonify({"status": "success", "accuracy": accuracy}), 200
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-# ==========================================================
-# API routes
+# API Routes
 # ==========================================================
 @app.route("/")
 def home():
     return jsonify({"message": "Revenue Forecast API active"})
-
 
 @app.route("/api/revenue/forecast", methods=["POST", "OPTIONS"])
 def forecast_revenue():
@@ -167,7 +143,6 @@ def forecast_revenue():
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
-
 @app.route("/api/revenue/history", methods=["GET", "OPTIONS"])
 def get_history():
     try:
@@ -177,7 +152,6 @@ def get_history():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
-
 
 @app.route("/api/revenue/download", methods=["GET"])
 def download_forecast():
@@ -196,9 +170,9 @@ def download_forecast():
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
-
 # ==========================================================
-# Run App
+# Run App (Render-compatible)
 # ==========================================================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
