@@ -9,7 +9,7 @@ from datetime import datetime
 import lightgbm as lgb
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -26,7 +26,7 @@ def forecast_revenue(model_type="hybrid"):
     # Sundays = 0 (clinic closed)
     df.loc[df["ds"].dt.dayofweek == 6, "y"] = 0
 
-    # Split train/test (last 14 days as validation)
+    # Split train/test (last 14 days for validation)
     train = df[:-14]
     test = df[-14:]
     future_periods = 30
@@ -54,20 +54,11 @@ def forecast_revenue(model_type="hybrid"):
     # ---------- Combine Hybrid ----------
     hybrid_pred = (exp_pred.values + prophet_pred.values + lightgbm_pred) / 3
 
-    # ---------- Metrics (on validation set) ----------
-    def mape(y_true, y_pred):
-        y_true, y_pred = np.array(y_true), np.array(y_pred)
-        return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
-
+    # ---------- MAE Calculation ----------
     mae = mean_absolute_error(test["y"], hybrid_pred)
-    rmse = np.sqrt(mean_squared_error(test["y"], hybrid_pred))
-    mape_val = mape(test["y"], hybrid_pred)
-
-    metrics = {"MAE": mae, "RMSE": rmse, "MAPE": mape_val}
 
     # ---------- Forecast Next 30 Days ----------
     exp_forecast = exp_model.forecast(future_periods)
-
     future_full = prophet.make_future_dataframe(periods=future_periods)
     prophet_forecast = prophet.predict(future_full).tail(future_periods)
 
@@ -93,7 +84,8 @@ def forecast_revenue(model_type="hybrid"):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results.to_excel(f"history/forecast_{timestamp}.xlsx", index=False)
 
-    return results, metrics
+    return results, mae
+
 
 # -------------------------------------------------------
 # Routes
@@ -102,17 +94,16 @@ def forecast_revenue(model_type="hybrid"):
 @app.route("/api/revenue/forecast", methods=["GET"])
 def get_forecast():
     try:
-        results, metrics = forecast_revenue()
+        results, mae = forecast_revenue()
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
             results.to_excel(writer, index=False)
         output.seek(0)
 
-        # Return both file + metrics
         preview = results.head(5).to_dict(orient="records")
         return jsonify({
             "message": "Forecast generated successfully",
-            "metrics": metrics,
+            "mae": mae,
             "preview": preview
         })
     except Exception as e:
@@ -141,6 +132,7 @@ def download_file(filename):
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({"message": "Revenue Forecast API running successfully."})
+
 
 # -------------------------------------------------------
 # Production entry point
