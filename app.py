@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
+from flask_cors import CORS, cross_origin   # ✅ added cross_origin import
 import pandas as pd
 import numpy as np
 import os
@@ -9,13 +9,14 @@ import traceback
 from sklearn.metrics import mean_absolute_error
 import lightgbm as lgb
 from prophet import Prophet
+import matplotlib.pyplot as plt
 
 # =====================================================
 # Flask App Configuration
 # =====================================================
 app = Flask(__name__)
 
-# ✅ Allow all origins TEMPORARILY for testing
+# ✅ Allow all origins temporarily for Render testing
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 @app.after_request
@@ -26,6 +27,10 @@ def after_request(response):
     response.headers.add("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
     response.headers.add("Access-Control-Allow-Credentials", "true")
     return response
+
+# ✅ Optional constant for your site domain
+FRONTEND_ORIGIN = "https://campbelldentalsystem.site"
+
 
 
 
@@ -178,4 +183,5 @@ def home():
 # =====================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
