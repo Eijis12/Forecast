@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS, cross_origin
+from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import os
@@ -15,18 +15,18 @@ from prophet import Prophet
 # =====================================================
 app = Flask(__name__)
 
-FRONTEND_ORIGIN = "https://campbelldentalsystem.site"  # Change if needed
-CORS(app, resources={r"/*": {"origins": FRONTEND_ORIGIN}}, supports_credentials=True)
-
+# ✅ Allow all origins TEMPORARILY for testing
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 @app.after_request
-def add_cors_headers(response):
-    """Ensure all responses have the correct CORS headers"""
-    response.headers["Access-Control-Allow-Origin"] = FRONTEND_ORIGIN
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+def after_request(response):
+    """Ensure proper CORS headers for all responses"""
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
+    response.headers.add("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    response.headers.add("Access-Control-Allow-Credentials", "true")
     return response
+
 
 
 # =====================================================
@@ -178,3 +178,4 @@ def home():
 # =====================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
