@@ -23,9 +23,15 @@ def generate_forecast():
     df = pd.read_excel(EXCEL_PATH)
     df.columns = [c.strip().upper() for c in df.columns]
 
+    # ✅ Automatically handle either 'AMOUNT' or 'REVENUE'
+    if "REVENUE" in df.columns and "AMOUNT" not in df.columns:
+        df.rename(columns={"REVENUE": "AMOUNT"}, inplace=True)
+
     required = {"YEAR", "MONTH", "DAY", "AMOUNT"}
     if not required.issubset(df.columns):
-        raise ValueError(f"Excel must contain columns: {required}. Found: {df.columns.tolist()}")
+        raise ValueError(
+            f"Excel must contain columns: {required}. Found: {df.columns.tolist()}"
+        )
 
     # === Safe numeric conversion ===
     for col in ["YEAR", "MONTH", "DAY", "AMOUNT"]:
@@ -46,14 +52,17 @@ def generate_forecast():
     if df["Date"].isna().any():
         start_date = pd.Timestamp("2020-01-01")
         df.loc[df["Date"].isna(), "Date"] = [
-            start_date + pd.Timedelta(days=i) for i in range(df["Date"].isna().sum())
+            start_date + pd.Timedelta(days=i)
+            for i in range(df["Date"].isna().sum())
         ]
 
     df["Revenue"] = df["AMOUNT"]
     df = df.dropna(subset=["Revenue"]).sort_values("Date")
 
     if df.empty:
-        raise ValueError("No valid data rows found. Please check your Excel file values.")
+        raise ValueError(
+            "No valid data rows found. Please check your Excel file values."
+        )
 
     # === Feature engineering ===
     df["Year"] = df["Date"].dt.year
@@ -65,7 +74,9 @@ def generate_forecast():
     y = df["Revenue"]
 
     # === Train LightGBM model ===
-    model = lgb.LGBMRegressor(objective="regression", n_estimators=120, learning_rate=0.1)
+    model = lgb.LGBMRegressor(
+        objective="regression", n_estimators=120, learning_rate=0.1
+    )
     model.fit(X, y)
 
     # === Predict next 30 days from today ===
@@ -81,7 +92,12 @@ def generate_forecast():
     })
 
     # === Forecast ===
-    future_df["Forecasted_Revenue"] = model.predict(future_df[["Year", "Month", "Day", "DayOfWeek"]])
+    future_df["Forecasted_Revenue"] = model.predict(
+        future_df[["Year", "Month", "Day", "DayOfWeek"]]
+    )
+
+    # === Sundays closed ===
+    future_df.loc[future_df["DayOfWeek"] == 6, "Forecasted_Revenue"] = 0
 
     # === Compute total and accuracy ===
     total_forecast = future_df["Forecasted_Revenue"].sum()
@@ -93,7 +109,7 @@ def generate_forecast():
             for d, r in zip(future_df["Date"], future_df["Forecasted_Revenue"])
         },
         "total_forecast": round(total_forecast, 2),
-        "accuracy": accuracy
+        "accuracy": accuracy,
     }
 
     return forecast_result
@@ -126,12 +142,8 @@ def get_history():
         if request.method == "OPTIONS":
             return jsonify({"status": "ok"}), 200
 
-        data = [
-            {"Date": "2025-10-11", "Total_Revenue": 180000, "Accuracy": 97.5},
-            {"Date": "2025-09-11", "Total_Revenue": 175000, "Accuracy": 96.8},
-        ]
-        
-        return jsonify({"status": "success", "data": data})
+        # ✅ Removed dummy data
+        return jsonify({"status": "success", "data": []})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -141,7 +153,9 @@ def get_history():
 def download_forecast():
     try:
         result = generate_forecast()
-        df = pd.DataFrame(list(result["daily_forecast"].items()), columns=["Date", "Forecasted_Revenue"])
+        df = pd.DataFrame(
+            list(result["daily_forecast"].items()), columns=["Date", "Forecasted_Revenue"]
+        )
 
         # Add summary row
         df.loc[len(df)] = ["Total (₱)", result["total_forecast"]]
@@ -159,6 +173,3 @@ def download_forecast():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
-
-
