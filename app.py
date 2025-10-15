@@ -10,7 +10,7 @@ import os
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ["https://campbelldentalsystem.site", "*"]}})
 
-EXCEL_PATH = "DentalRecords_RevenueForecasting.xlsx"
+EXCEL_PATH = "Dental_Revenue_2425.xlsx"
 
 
 # ==========================================================
@@ -159,5 +159,6 @@ def download_forecast():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
 
 
