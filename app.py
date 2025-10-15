@@ -4,6 +4,10 @@ import pandas as pd
 import numpy as np
 import io
 import datetime
+import traceback
+import os
+
+# forecasting libs
 from prophet import Prophet
 import lightgbm as lgb
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
@@ -12,141 +16,256 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# ==========================================================
-# 📘 Utility Functions
-# ==========================================================
-def prepare_dataframe(file_path="DentalRecords_RevenueForecasting.xlsx"):
-    df = pd.read_excel(file_path)
-    df.columns = df.columns.str.strip().str.lower()
-    if not {'year', 'month', 'day', 'revenue'}.issubset(df.columns):
-        raise ValueError("Excel must have columns: YEAR, MONTH, DAY, REVENUE")
-
-    df['ds'] = pd.to_datetime(df[['year', 'month', 'day']])
-    df = df[['ds', 'revenue']].rename(columns={'revenue': 'y'})
-    df = df.sort_values('ds')
-    return df
+# Path to your Excel file on the server
+EXCEL_PATH = "Dental_Revenue_2425.xlsx"
 
 
-def calculate_metrics(actual, predicted):
-    # Align lengths
-    min_len = min(len(actual), len(predicted))
-    actual, predicted = actual[:min_len], predicted[:min_len]
-    mae = mean_absolute_error(actual, predicted)
-    rmse = mean_squared_error(actual, predicted, squared=False)
-    mape = np.mean(np.abs((np.array(actual) - np.array(predicted)) / np.array(actual))) * 100
-    return mae, rmse, mape
+# -------------------------
+# Helper: robustly load the Excel into a standard dataframe with columns: ds (datetime), y (revenue)
+# Accepts:
+#  - Columns YEAR, MONTH, DAY + REVENUE or AMOUNT
+#  - Or single DATE column and REVENUE/AMOUNT
+# -------------------------
+def load_revenue_dataframe(path=EXCEL_PATH):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Excel file not found at path: {path}")
+
+    # read
+    df = pd.read_excel(path, sheet_name=0, engine="openpyxl" if path.lower().endswith(("xlsx", "xlsm")) else None)
+
+    # normalize column names
+    df.columns = [str(c).strip().upper() for c in df.columns]
+
+    cols = set(df.columns)
+
+    # prioritize explicit date columns YEAR/MONTH/DAY
+    if {"YEAR", "MONTH", "DAY"}.issubset(cols):
+        # revenue can be called REVENUE or AMOUNT; accept either
+        if "REVENUE" in cols:
+            revenue_col = "REVENUE"
+        elif "AMOUNT" in cols:
+            revenue_col = "AMOUNT"
+        else:
+            raise ValueError("Excel must include a revenue column named 'REVENUE' or 'AMOUNT' when using YEAR/MONTH/DAY.")
+
+        # make numeric and safe parse
+        for c in ("YEAR", "MONTH", "DAY"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        df["ds"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]], errors="coerce")
+        df["y"] = pd.to_numeric(df[revenue_col], errors="coerce")
+        df = df.dropna(subset=["ds"])  # remove rows we couldn't parse a date for
+        df = df.dropna(subset=["y"]).sort_values("ds")
+        if df.empty:
+            raise ValueError("After parsing YEAR/MONTH/DAY and the revenue column, no valid rows remain.")
+        return df[["ds", "y"]]
+
+    # fallback: single DATE column
+    # possible names: DATE, DS, DAY_DATE etc — find something that parses as a date
+    date_candidates = [c for c in df.columns if "DATE" in c or c in ("DS", "D")]
+    if date_candidates:
+        date_col = date_candidates[0]
+        # revenue column:
+        if "REVENUE" in cols:
+            revenue_col = "REVENUE"
+        elif "AMOUNT" in cols:
+            revenue_col = "AMOUNT"
+        else:
+            raise ValueError("Excel must include a revenue column named 'REVENUE' or 'AMOUNT' when using a DATE column.")
+
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df[revenue_col] = pd.to_numeric(df[revenue_col], errors="coerce")
+        df = df.dropna(subset=[date_col]).dropna(subset=[revenue_col]).sort_values(date_col)
+        if df.empty:
+            raise ValueError("After parsing DATE and revenue columns, no valid rows remain.")
+        df = df.rename(columns={date_col: "ds", revenue_col: "y"})
+        return df[["ds", "y"]]
+
+    # If reached here, we couldn't find date-like columns
+    raise ValueError("Excel must have columns: YEAR, MONTH, DAY, and REVENUE/AMOUNT OR a DATE column plus REVENUE/AMOUNT.")
 
 
-# ==========================================================
-# 🧠 Hybrid Model (Exponential Smoothing + Prophet + LightGBM)
-# ==========================================================
-def hybrid_forecast(df, forecast_days=30):
-    df = df.copy()
-    train = df.copy()
-
-    # --- Exponential Smoothing ---
-    es_model = ExponentialSmoothing(
-        train['y'], trend='add', seasonal='add', seasonal_periods=7
-    ).fit()
-    es_forecast = es_model.forecast(forecast_days)
-
-    # --- Prophet ---
-    prophet_model = Prophet(daily_seasonality=True, yearly_seasonality=True)
-    prophet_model.fit(train)
-    future = prophet_model.make_future_dataframe(periods=forecast_days)
-    prophet_forecast = prophet_model.predict(future)
-    prophet_values = prophet_forecast.tail(forecast_days)['yhat'].values
-
-    # --- LightGBM ---
-    train['dayofweek'] = train['ds'].dt.dayofweek
-    train['month'] = train['ds'].dt.month
-    train['year'] = train['ds'].dt.year
-    features = ['dayofweek', 'month', 'year']
-
-    X = train[features]
-    y = train['y']
-    lgb_train = lgb.Dataset(X, label=y)
-    params = {'objective': 'regression', 'verbosity': -1, 'boosting_type': 'gbdt'}
-    lgb_model = lgb.train(params, lgb_train, num_boost_round=100)
-
-    # Create next 30 days
-    last_date = df['ds'].max()
-    future_dates = [last_date + datetime.timedelta(days=i) for i in range(1, forecast_days + 1)]
-    future_features = pd.DataFrame({
-        'dayofweek': [d.weekday() for d in future_dates],
-        'month': [d.month for d in future_dates],
-        'year': [d.year for d in future_dates]
-    })
-
-    lgb_forecast = lgb_model.predict(future_features)
-
-    # --- Combine results ---
-    combined_forecast = (es_forecast.values + prophet_values + lgb_forecast) / 3
-
-    forecast_df = pd.DataFrame({
-        'Date': future_dates,
-        'Forecasted_Revenue': combined_forecast
-    })
-
-    # --- Make Sundays (dayofweek=6 in Python, but 0 in JS) zero ---
-    forecast_df.loc[[d.weekday() == 6 for d in forecast_df['Date']], 'Forecasted_Revenue'] = 0
-
-    total_forecast = forecast_df['Forecasted_Revenue'].sum()
-
-    # --- Backtest metrics (on last N days of actuals) ---
-    backtest_size = min(30, len(df))
-    actual_recent = df['y'].tail(backtest_size).values
-    predicted_recent = es_model.fittedvalues.tail(backtest_size).values
-    mae, rmse, mape = calculate_metrics(actual_recent, predicted_recent)
-
-    metrics = {"MAE": mae, "RMSE": rmse, "MAPE": mape}
-
-    return forecast_df, total_forecast, metrics
+# -------------------------
+# Metrics helpers (safe)
+# -------------------------
+def safe_mape(actual, predicted):
+    actual = np.array(actual)
+    predicted = np.array(predicted)
+    mask = actual != 0
+    if not np.any(mask):
+        return None
+    return float(np.mean(np.abs((actual[mask] - predicted[mask]) / actual[mask])) * 100)
 
 
-# ==========================================================
-# 📈 API Routes
-# ==========================================================
-@app.route("/api/revenue/forecast", methods=["POST"])
-def forecast_revenue():
+# -------------------------
+# Forecasting: hybrid & metrics
+# -------------------------
+def generate_forecast_and_metrics(forecast_days=30):
+    # load and standardize data
+    df = load_revenue_dataframe(EXCEL_PATH)  # returns columns ds (datetime), y (float)
+    df = df.reset_index(drop=True)
+
+    # if dataset is very short, raise helpful error
+    if len(df) < 10:
+        raise ValueError("Not enough historical data (need at least ~10 rows).")
+
+    # --- backtest: hold out last N days for validation (use min(30, 20% of data) )
+    backtest_size = min(30, max(1, int(len(df) * 0.2)))
+    train_df = df.iloc[:-backtest_size].copy()
+    test_df = df.iloc[-backtest_size:].copy()
+
+    # ---------- Exponential Smoothing (on train)
     try:
-        df = prepare_dataframe()
-        forecast_df, total_forecast, metrics = hybrid_forecast(df)
+        es = ExponentialSmoothing(train_df["y"], trend="add", seasonal=None).fit()
+        es_test_pred = es.forecast(backtest_size)
+    except Exception:
+        # fallback to train mean
+        es_test_pred = np.repeat(train_df["y"].mean(), backtest_size)
 
-        result = {
-            "status": "success",
-            "data": {
-                "daily_forecast": dict(zip(forecast_df['Date'].dt.strftime('%Y-%m-%d'), forecast_df['Forecasted_Revenue'])),
-                "total_forecast": float(total_forecast),
-                "metrics": metrics
-            }
-        }
-        return jsonify(result)
+    # ---------- Prophet (on train)
+    try:
+        prophet_train = train_df.rename(columns={"ds": "ds", "y": "y"})
+        prophet_model = Prophet(daily_seasonality=True)
+        prophet_model.fit(prophet_train)
+        future = prophet_model.make_future_dataframe(periods=backtest_size)
+        prophet_pred = prophet_model.predict(future).tail(backtest_size)["yhat"].values
+    except Exception:
+        prophet_pred = np.repeat(train_df["y"].mean(), backtest_size)
+
+    # ---------- LightGBM (on train)
+    try:
+        # prepare lag features simple: dayofweek, month, year
+        def mk_features(df_):
+            return pd.DataFrame({
+                "dayofweek": df_["ds"].dt.dayofweek,
+                "month": df_["ds"].dt.month,
+                "year": df_["ds"].dt.year
+            })
+        X_train = mk_features(train_df)
+        y_train = train_df["y"].values
+        X_test = mk_features(test_df)
+        lgbm = lgb.LGBMRegressor(objective="regression", n_estimators=100)
+        lgbm.fit(X_train, y_train)
+        lgb_test_pred = lgbm.predict(X_test)
+    except Exception:
+        lgb_test_pred = np.repeat(train_df["y"].mean(), backtest_size)
+
+    # --- Hybrid (validation predictions)
+    hybrid_test_pred = (np.array(es_test_pred) + np.array(prophet_pred) + np.array(lgb_test_pred)) / 3.0
+
+    # --- Metrics (on test_df)
+    actual = test_df["y"].values
+    mae = float(mean_absolute_error(actual, hybrid_test_pred))
+    rmse = float(mean_squared_error(actual, hybrid_test_pred, squared=False))
+    mape_val = safe_mape(actual, hybrid_test_pred)
+    mape = float(round(mape_val, 4)) if mape_val is not None else None
+
+    # ---------- Now produce final future forecast for next forecast_days
+    # We'll train models on the full dataset and forecast forward
+    # Exponential Smoothing full
+    try:
+        es_full = ExponentialSmoothing(df["y"], trend="add", seasonal=None).fit()
+        es_future = es_full.forecast(forecast_days)
+    except Exception:
+        es_future = np.repeat(df["y"].mean(), forecast_days)
+
+    # Prophet full
+    try:
+        prophet_full = Prophet(daily_seasonality=True)
+        prophet_full.fit(df.rename(columns={"ds": "ds", "y": "y"}))
+        future_df_prophet = prophet_full.make_future_dataframe(periods=forecast_days)
+        prophet_future = prophet_full.predict(future_df_prophet).tail(forecast_days)["yhat"].values
+    except Exception:
+        prophet_future = np.repeat(df["y"].mean(), forecast_days)
+
+    # LightGBM full
+    try:
+        features_full = pd.DataFrame({
+            "dayofweek": df["ds"].dt.dayofweek,
+            "month": df["ds"].dt.month,
+            "year": df["ds"].dt.year
+        })
+        lgb_full = lgb.LGBMRegressor(objective="regression", n_estimators=100)
+        lgb_full.fit(features_full, df["y"].values)
+
+        last_date = df["ds"].max()
+        future_dates = [last_date + datetime.timedelta(days=i) for i in range(1, forecast_days + 1)]
+        future_features = pd.DataFrame({
+            "dayofweek": [d.weekday() for d in future_dates],
+            "month": [d.month for d in future_dates],
+            "year": [d.year for d in future_dates]
+        })
+        lgb_future = lgb_full.predict(future_features)
+    except Exception:
+        # fallback
+        future_dates = [df["ds"].max() + datetime.timedelta(days=i) for i in range(1, forecast_days + 1)]
+        lgb_future = np.repeat(df["y"].mean(), forecast_days)
+
+    # Combine three forecasts (simple average)
+    combined = (np.array(es_future) + np.array(prophet_future) + np.array(lgb_future)) / 3.0
+
+    # Set Sundays to 0 (Sunday weekday() == 6)
+    for i, d in enumerate(future_dates):
+        if d.weekday() == 6:
+            combined[i] = 0.0
+
+    # Build daily_forecast dict
+    daily_forecast = {d.strftime("%Y-%m-%d"): float(round(float(val), 2)) for d, val in zip(future_dates, combined)}
+    total_forecast = float(round(float(np.sum(combined)), 2))
+
+    metrics = {
+        "MAE": float(round(mae, 2)),
+        "RMSE": float(round(rmse, 2)),
+        # ensure MAPE is JSON-friendly; if None set to None
+        "MAPE": float(round(mape, 2)) if mape is not None else None
+    }
+
+    return {
+        "daily_forecast": daily_forecast,
+        "total_forecast": total_forecast,
+        "metrics": metrics
+    }
+
+
+# -------------------------
+# API Routes
+# -------------------------
+@app.route("/api/revenue/forecast", methods=["POST", "OPTIONS"])
+def api_forecast():
+    try:
+        if request.method == "OPTIONS":
+            return jsonify({"status": "ok"}), 200
+        result = generate_forecast_and_metrics()
+        return jsonify({"status": "success", "data": result}), 200
     except Exception as e:
+        # log server side
+        traceback.print_exc()
+        # return readable error to frontend
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route("/api/revenue/download", methods=["GET"])
-def download_forecast():
+def api_download():
     try:
-        df = prepare_dataframe()
-        forecast_df, total_forecast, metrics = hybrid_forecast(df)
+        res = generate_forecast_and_metrics()
+        daily = res["daily_forecast"]
+        df_out = pd.DataFrame(list(daily.items()), columns=["Date", "Forecasted_Revenue"])
+        # add summary
+        df_out.loc[len(df_out)] = ["Total (₱)", res["total_forecast"]]
         output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            forecast_df.to_excel(writer, index=False, sheet_name='Forecast')
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            df_out.to_excel(writer, index=False, sheet_name="Forecast")
         output.seek(0)
-        return send_file(output, as_attachment=True, download_name="Forecast_Output.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        return send_file(output, as_attachment=True, download_name="RevenueForecast.xlsx")
     except Exception as e:
+        traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route("/")
 def home():
-    return jsonify({"message": "Revenue Forecast API with Hybrid Model + Metrics"})
+    return jsonify({"message": "Revenue Forecast API (robust) active"})
 
 
-# ==========================================================
-# 🏁 Run
-# ==========================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
