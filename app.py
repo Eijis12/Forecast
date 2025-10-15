@@ -1,133 +1,177 @@
-from flask import Flask, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
-import math, traceback
-from prophet import Prophet
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
+import os
+import datetime
+import io
 import lightgbm as lgb
+from prophet import Prophet
 from sklearn.metrics import mean_absolute_error
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-EXCEL_PATH = "Dental_Revenue_2425.xlsx"
+HISTORY_FILE = "forecast_history.xlsx"
 
-def safe_float(x):
-    """Ensure value is always JSON serializable float"""
-    try:
-        if pd.isna(x):
-            return 0.0
-        val = float(x)
-        return val if math.isfinite(val) else 0.0
-    except:
-        return 0.0
+# ==========================================================
+# Utility: ensure history file exists
+# ==========================================================
+def initialize_history():
+    if not os.path.exists(HISTORY_FILE):
+        df = pd.DataFrame(columns=["Date", "Actual", "Predicted", "Model", "MAE"])
+        df.to_excel(HISTORY_FILE, index=False)
 
+initialize_history()
 
-def generate_forecast():
-    # Load data
-    df = pd.read_excel(EXCEL_PATH)
-    df.columns = [c.strip().upper() for c in df.columns]
-    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
-    df = df.dropna(subset=["DATE"]).sort_values("DATE").reset_index(drop=True)
-    df["REVENUE"] = pd.to_numeric(df["REVENUE"], errors="coerce").fillna(0)
+# ==========================================================
+# Utility: recursive hybrid forecasting function
+# ==========================================================
+def hybrid_recursive_forecast(df, forecast_days=30):
+    df = df.copy()
+    df["ds"] = pd.to_datetime(df["ds"])
+    df["y"] = df["y"].astype(float)
+    df = df.sort_values("ds")
 
-    # ---------- STEP 1: Exponential Smoothing ----------
-    es_model = ExponentialSmoothing(df["REVENUE"], trend="add")
-    es_fit = es_model.fit()
-    es_forecast = es_fit.forecast(30).astype(float)
+    # Prophet Model
+    prophet = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
+    prophet.fit(df[["ds", "y"]])
 
-    # ---------- STEP 2: Prophet ----------
-    prophet_df = df.rename(columns={"DATE": "ds", "REVENUE": "y"})
-    prophet = Prophet(daily_seasonality=True)
-    prophet.fit(prophet_df)
-    prophet_future = prophet.make_future_dataframe(periods=30)
-    prophet_pred = prophet.predict(prophet_future)
-    prophet_forecast = prophet_pred.tail(30)["yhat"].astype(float).values
+    # LightGBM Features
+    df["dayofweek"] = df["ds"].dt.dayofweek
+    df["month"] = df["ds"].dt.month
+    df["lag1"] = df["y"].shift(1)
+    df["lag7"] = df["y"].shift(7)
+    df = df.dropna()
 
-    # ---------- STEP 3: LightGBM residual correction ----------
-    # Create features
-    df["day_of_week"] = df["DATE"].dt.dayofweek
-    df["is_weekend"] = df["day_of_week"].isin([5,6]).astype(int)
-    df["month"] = df["DATE"].dt.month
+    features = ["dayofweek", "month", "lag1", "lag7"]
+    X_train, y_train = df[features], df["y"]
 
-    # Hybrid base (recursive)
-    df["Hybrid_forecast"] = (
-        0.3 * df["REVENUE"]
-        + 0.3 * df["REVENUE"].shift(1).fillna(0)
-        + 0.4 * df["REVENUE"].shift(2).fillna(0)
+    model_lgb = lgb.LGBMRegressor(
+        n_estimators=300,
+        learning_rate=0.05,
+        num_leaves=31,
+        random_state=42
     )
+    model_lgb.fit(X_train, y_train)
 
-    df["y_smooth"] = df["REVENUE"].rolling(3, min_periods=1).mean()
-    df["Residual"] = df["y_smooth"] - df["Hybrid_forecast"]
+    # Recursive Forecasting
+    future_dates = []
+    last_known_date = df["ds"].max()
+    last_known_values = df.copy()
 
-    features = ["day_of_week", "is_weekend", "month"]
-    X_train = df[features]
-    y_train = df["Residual"]
+    for i in range(forecast_days):
+        next_date = last_known_date + datetime.timedelta(days=1)
+        dayofweek = next_date.weekday()
+        month = next_date.month
 
-    lgb_model = lgb.LGBMRegressor(
-        n_estimators=300, learning_rate=0.05, max_depth=6,
-        num_leaves=31, subsample=0.8, colsample_bytree=0.8, random_state=42
-    )
-    lgb_model.fit(X_train, y_train)
+        # skip Sundays (revenue = 0)
+        if dayofweek == 6:
+            next_y = 0
+        else:
+            lag1 = last_known_values.iloc[-1]["y"]
+            lag7 = last_known_values.iloc[-7]["y"] if len(last_known_values) >= 7 else lag1
 
-    # ---------- STEP 4: Forecast next 30 days ----------
-    future_dates = pd.date_range(df["DATE"].max() + pd.Timedelta(days=1), periods=30)
-    future_df = pd.DataFrame({
-        "DATE": future_dates,
-        "day_of_week": future_dates.dayofweek,
-        "is_weekend": (future_dates.dayofweek.isin([5,6])).astype(int),
-        "month": future_dates.month
-    })
+            # Prophet prediction for next date
+            prophet_pred = prophet.predict(pd.DataFrame({"ds": [next_date]}))["yhat"].values[0]
 
-    # LightGBM residuals for future
-    future_resid = lgb_model.predict(future_df[features]).astype(float)
+            # LightGBM prediction using lags
+            next_x = np.array([[dayofweek, month, lag1, lag7]])
+            lgb_pred = model_lgb.predict(next_x)[0]
 
-    # Combine hybrid base from ES + Prophet + residual correction
-    hybrid_future = 0.3 * es_forecast + 0.3 * prophet_forecast + 0.4 * es_forecast
-    corrected_future = hybrid_future + future_resid
+            # hybrid blend
+            next_y = 0.5 * prophet_pred + 0.5 * lgb_pred
 
-    # Set Sundays to zero (clinic closed)
-    for i, d in enumerate(future_dates):
-        if d.dayofweek == 6:
-            corrected_future[i] = 0.0
+        future_dates.append({"ds": next_date, "y": next_y})
+        new_row = pd.DataFrame({"ds": [next_date], "y": [next_y]})
+        last_known_values = pd.concat([last_known_values, new_row], ignore_index=True)
+        last_known_date = next_date
 
-    # Convert to plain floats
-    corrected_future = [safe_float(x) for x in corrected_future]
-
-    # ---------- STEP 5: Metrics ----------
-    mae = mean_absolute_error(df["y_smooth"], df["Hybrid_forecast"])
-    mae_monthly = mae * 30
-    total_forecast = round(float(np.sum(corrected_future)), 2)
-
-    print(f"✅ Forecast generated: total ₱{total_forecast:,.2f}, MAE ₱{mae:,.2f}")
-
-    # ---------- STEP 6: Return to dashboard ----------
-    chart_data = [
-        {"date": str(d.date()), "revenue": safe_float(v), "type": "forecast"}
-        for d, v in zip(future_dates, corrected_future)
-    ]
-
-    return {
-        "status": "success",
-        "data": {
-            "chart_data": chart_data,
-            "total_forecast": total_forecast,
-            "mae_daily": round(mae, 2),
-            "mae_monthly": round(mae_monthly, 2)
-        }
-    }
+    forecast_df = pd.DataFrame(future_dates)
+    return forecast_df
 
 
+# ==========================================================
+# Forecast API
+# ==========================================================
 @app.route("/api/revenue/forecast", methods=["POST"])
-def forecast_api():
+def forecast_revenue():
     try:
-        result = generate_forecast()
-        return jsonify(result), 200
+        file = request.files.get("file")
+        if not file:
+            return jsonify({"error": "No file uploaded"}), 400
+
+        df = pd.read_excel(file)
+        df.columns = [col.strip().upper() for col in df.columns]
+
+        if "DATE" not in df.columns or "REVENUE" not in df.columns:
+            return jsonify({"error": "Missing DATE or REVENUE column"}), 400
+
+        df = df.rename(columns={"DATE": "ds", "REVENUE": "y"})
+        df["ds"] = pd.to_datetime(df["ds"])
+        df = df.sort_values("ds")
+        df["y"] = pd.to_numeric(df["y"], errors="coerce").fillna(0)
+
+        # Split into train/validation for MAE check
+        train_size = int(len(df) * 0.9)
+        train_df = df.iloc[:train_size]
+        valid_df = df.iloc[train_size:]
+
+        forecast_df = hybrid_recursive_forecast(train_df, forecast_days=len(valid_df))
+
+        mae = mean_absolute_error(valid_df["y"].values, forecast_df["y"].values[: len(valid_df)])
+
+        # Combine actual + forecast for display
+        forecast_df["Actual"] = list(valid_df["y"].values[: len(forecast_df)]) + [np.nan] * max(
+            0, len(forecast_df) - len(valid_df)
+        )
+        forecast_df["Model"] = "Hybrid (Prophet + LightGBM)"
+        forecast_df["MAE"] = mae
+
+        # Save to Excel history
+        initialize_history()
+        existing = pd.read_excel(HISTORY_FILE)
+        combined = pd.concat(
+            [existing, forecast_df[["ds", "Actual", "y", "Model", "MAE"]].rename(columns={"ds": "Date", "y": "Predicted"})],
+            ignore_index=True,
+        )
+        combined.to_excel(HISTORY_FILE, index=False)
+
+        return jsonify(
+            {
+                "message": "Forecast completed successfully",
+                "mae": round(mae, 2),
+                "forecast": forecast_df.to_dict(orient="records"),
+            }
+        )
+
     except Exception as e:
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
+        import traceback
+
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
+# ==========================================================
+# Download API
+# ==========================================================
+@app.route("/api/revenue/download", methods=["GET"])
+def download_history():
+    if not os.path.exists(HISTORY_FILE):
+        return jsonify({"error": "No forecast history available"}), 404
+
+    return send_file(HISTORY_FILE, as_attachment=True)
+
+
+# ==========================================================
+# Root
+# ==========================================================
+@app.route("/")
+def home():
+    return "Dental Revenue Forecasting API - Hybrid Recursive Model is running!"
+
+
+# ==========================================================
+# Run App
+# ==========================================================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, debug=True)
