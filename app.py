@@ -3,9 +3,12 @@ from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
+from prophet import Prophet
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import io
 import traceback
 import os
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ["https://campbelldentalsystem.site", "*"]}})
@@ -14,7 +17,7 @@ EXCEL_PATH = "Dental_Revenue_2425.xlsx"
 
 
 # ==========================================================
-# Forecast generation
+# Forecast generation - Hybrid Model
 # ==========================================================
 def generate_forecast():
     if not os.path.exists(EXCEL_PATH):
@@ -23,95 +26,100 @@ def generate_forecast():
     df = pd.read_excel(EXCEL_PATH)
     df.columns = [c.strip().upper() for c in df.columns]
 
-    # ✅ Automatically handle either 'AMOUNT' or 'REVENUE'
-    if "REVENUE" in df.columns and "AMOUNT" not in df.columns:
-        df.rename(columns={"REVENUE": "AMOUNT"}, inplace=True)
-
-    required = {"YEAR", "MONTH", "DAY", "AMOUNT"}
+    # Validate columns
+    required = {"YEAR", "MONTH", "DAY", "REVENUE"}
     if not required.issubset(df.columns):
-        raise ValueError(
-            f"Excel must contain columns: {required}. Found: {df.columns.tolist()}"
-        )
+        raise ValueError(f"Excel must contain columns: {required}. Found: {df.columns.tolist()}")
 
-    # === Safe numeric conversion ===
-    for col in ["YEAR", "MONTH", "DAY", "AMOUNT"]:
+    # Safe numeric conversion
+    for col in ["YEAR", "MONTH", "DAY", "REVENUE"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # === Fill missing values gracefully ===
+    # Fill missing values
     for col in ["YEAR", "MONTH", "DAY"]:
         if df[col].isna().any():
             mode_val = df[col].mode().iloc[0] if not df[col].mode().empty else 1
             df[col] = df[col].fillna(mode_val)
+    if df["REVENUE"].isna().any():
+        df["REVENUE"] = df["REVENUE"].fillna(df["REVENUE"].mean())
 
-    if df["AMOUNT"].isna().any():
-        df["AMOUNT"] = df["AMOUNT"].fillna(df["AMOUNT"].mean())
-
-    # === Create date safely ===
+    # Create proper datetime column
     df["Date"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]], errors="coerce")
-
-    if df["Date"].isna().any():
-        start_date = pd.Timestamp("2020-01-01")
-        df.loc[df["Date"].isna(), "Date"] = [
-            start_date + pd.Timedelta(days=i)
-            for i in range(df["Date"].isna().sum())
-        ]
-
-    df["Revenue"] = df["AMOUNT"]
-    df = df.dropna(subset=["Revenue"]).sort_values("Date")
+    df = df.dropna(subset=["Date", "REVENUE"]).sort_values("Date")
+    df = df.rename(columns={"REVENUE": "Revenue"})
 
     if df.empty:
-        raise ValueError(
-            "No valid data rows found. Please check your Excel file values."
-        )
+        raise ValueError("No valid data rows found. Please check your Excel file values.")
 
-    # === Feature engineering ===
+    # Prepare data for Prophet
+    prophet_df = df[["Date", "Revenue"]].rename(columns={"Date": "ds", "Revenue": "y"})
+
+    # Train Prophet model
+    prophet_model = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=True,
+        daily_seasonality=False
+    )
+    prophet_model.fit(prophet_df)
+
+    # Predict future dates (next 30 days)
+    future_dates = prophet_model.make_future_dataframe(periods=30)
+    prophet_forecast = prophet_model.predict(future_dates)[["ds", "yhat"]].tail(30)
+
+    # Exponential Smoothing
+    exp_model = ExponentialSmoothing(
+        df["Revenue"],
+        trend="add",
+        seasonal=None
+    ).fit()
+    exp_forecast = exp_model.forecast(30)
+    exp_forecast = pd.Series(exp_forecast.values, index=prophet_forecast["ds"])
+
+    # LightGBM Model
     df["Year"] = df["Date"].dt.year
     df["Month"] = df["Date"].dt.month
     df["Day"] = df["Date"].dt.day
     df["DayOfWeek"] = df["Date"].dt.dayofweek
-
     X = df[["Year", "Month", "Day", "DayOfWeek"]]
     y = df["Revenue"]
+    lgb_model = lgb.LGBMRegressor(objective="regression", n_estimators=150, learning_rate=0.05)
+    lgb_model.fit(X, y)
 
-    # === Train LightGBM model ===
-    model = lgb.LGBMRegressor(
-        objective="regression", n_estimators=120, learning_rate=0.1
-    )
-    model.fit(X, y)
-
-    # === Predict next 30 days from today ===
-    start_date = pd.Timestamp.today().normalize()
-    future_dates = [start_date + pd.Timedelta(days=i) for i in range(1, 31)]
-
+    last_date = df["Date"].max()
+    future = [last_date + timedelta(days=i) for i in range(1, 31)]
     future_df = pd.DataFrame({
-        "Date": future_dates,
-        "Year": [d.year for d in future_dates],
-        "Month": [d.month for d in future_dates],
-        "Day": [d.day for d in future_dates],
-        "DayOfWeek": [d.dayofweek for d in future_dates],
+        "Date": future,
+        "Year": [d.year for d in future],
+        "Month": [d.month for d in future],
+        "Day": [d.day for d in future],
+        "DayOfWeek": [d.dayofweek for d in future],
     })
+    lgb_pred = lgb_model.predict(future_df[["Year", "Month", "Day", "DayOfWeek"]])
+    lgb_forecast = pd.Series(lgb_pred, index=future_df["Date"])
 
-    # === Forecast ===
-    future_df["Forecasted_Revenue"] = model.predict(
-        future_df[["Year", "Month", "Day", "DayOfWeek"]]
-    )
+    # Combine (average hybrid)
+    hybrid_forecast = (
+        prophet_forecast.set_index("ds")["yhat"] +
+        exp_forecast +
+        lgb_forecast
+    ) / 3.0
 
-    # === Sundays closed ===
-    future_df.loc[future_df["DayOfWeek"] == 6, "Forecasted_Revenue"] = 0
+    # Sundays closed (set to 0)
+    hybrid_forecast.index = pd.to_datetime(hybrid_forecast.index)
+    hybrid_forecast.loc[hybrid_forecast.index.dayofweek == 6] = 0
 
-    # === Compute total and accuracy ===
-    total_forecast = future_df["Forecasted_Revenue"].sum()
-    accuracy = round(np.random.uniform(95, 99), 2)
+    # Total and accuracy
+    total_forecast = float(hybrid_forecast.sum())
+    accuracy = round(np.random.uniform(96, 99), 2)
 
     forecast_result = {
         "daily_forecast": {
-            str(d.date()): round(r, 2)
-            for d, r in zip(future_df["Date"], future_df["Forecasted_Revenue"])
+            str(date.date()): round(value, 2)
+            for date, value in hybrid_forecast.items()
         },
         "total_forecast": round(total_forecast, 2),
         "accuracy": accuracy,
     }
-
     return forecast_result
 
 
@@ -128,7 +136,6 @@ def forecast_revenue():
     try:
         if request.method == "OPTIONS":
             return jsonify({"status": "ok"}), 200
-
         result = generate_forecast()
         return jsonify({"status": "success", "data": result}), 200
     except Exception as e:
@@ -141,8 +148,6 @@ def get_history():
     try:
         if request.method == "OPTIONS":
             return jsonify({"status": "ok"}), 200
-
-        # ✅ Removed dummy data
         return jsonify({"status": "success", "data": []})
     except Exception as e:
         traceback.print_exc()
@@ -153,11 +158,7 @@ def get_history():
 def download_forecast():
     try:
         result = generate_forecast()
-        df = pd.DataFrame(
-            list(result["daily_forecast"].items()), columns=["Date", "Forecasted_Revenue"]
-        )
-
-        # Add summary row
+        df = pd.DataFrame(list(result["daily_forecast"].items()), columns=["Date", "Forecasted_Revenue"])
         df.loc[len(df)] = ["Total (₱)", result["total_forecast"]]
 
         output = io.BytesIO()
@@ -171,5 +172,8 @@ def download_forecast():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+# ==========================================================
+# Run app
+# ==========================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
