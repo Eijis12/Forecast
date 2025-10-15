@@ -24,7 +24,6 @@ EXCEL_PATH = "Dental_Revenue_2425.xlsx"
 # Helpers
 # --------------------------
 def safe_float(x, fallback=0.0):
-    """Convert numpy/pandas numbers to float and handle NaN/inf."""
     try:
         if x is None:
             return float(fallback)
@@ -36,10 +35,6 @@ def safe_float(x, fallback=0.0):
         return float(fallback)
     except Exception:
         return float(fallback)
-
-
-def ensure_list_of_floats(arr):
-    return [safe_float(v, 0.0) for v in list(arr)]
 
 
 # --------------------------
@@ -62,24 +57,25 @@ def generate_forecast():
     for col in ["YEAR", "MONTH", "DAY", "AMOUNT"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # Construct DATE
     if "DATE" in df.columns:
         df["DATE_PARSED"] = pd.to_datetime(df["DATE"], errors="coerce")
         if df["DATE_PARSED"].notna().any():
             df["DATE"] = df["DATE_PARSED"]
-    if "DATE" not in df.columns or df["DATE"].isna().all():
+    else:
         df["DATE"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]], errors="coerce")
-    df["DATE"] = df["DATE"].fillna(method="ffill").fillna(method="bfill")
+
+    df = df.dropna(subset=["DATE"])
+    df = df.sort_values("DATE").reset_index(drop=True)
 
     df["REVENUE_VAL"] = pd.to_numeric(df["AMOUNT"], errors="coerce")
-    df = df.dropna(subset=["DATE", "REVENUE_VAL"]).sort_values("DATE").reset_index(drop=True)
-
-    if df.empty:
-        raise ValueError("No valid data rows found after cleaning.")
-
+    df = df.dropna(subset=["REVENUE_VAL"])
     df["DOW"] = df["DATE"].dt.dayofweek
     df["IS_WEEKEND"] = df["DOW"].isin([5, 6]).astype(int)
 
-    # --- 1) Exponential Smoothing ---
+    # --------------------------
+    # 1) Exponential Smoothing
+    # --------------------------
     try:
         es_model = ExponentialSmoothing(df["REVENUE_VAL"], trend="add", seasonal=None)
         es_fit = es_model.fit(optimized=True)
@@ -89,7 +85,9 @@ def generate_forecast():
         es_forecast = pd.Series(np.repeat(df["REVENUE_VAL"].mean(), 30))
         es_fitted = pd.Series(np.repeat(df["REVENUE_VAL"].mean(), len(df)))
 
-    # --- 2) Prophet ---
+    # --------------------------
+    # 2) Prophet
+    # --------------------------
     try:
         prophet_df = df[["DATE", "REVENUE_VAL"]].rename(columns={"DATE": "ds", "REVENUE_VAL": "y"})
         prophet_model = Prophet(daily_seasonality=True)
@@ -100,19 +98,21 @@ def generate_forecast():
     except Exception:
         prophet_forecast = np.repeat(df["REVENUE_VAL"].mean(), 30)
 
-    # --- 3) LightGBM Recursive Forecast ---
+    # --------------------------
+    # 3) LightGBM Recursive Forecast (next 30 days from today)
+    # --------------------------
     try:
         lgb_features = ["YEAR", "MONTH", "DAY", "DOW"]
         X = df[lgb_features]
         y = df["REVENUE_VAL"]
+
         lgb_model = lgb.LGBMRegressor(objective="regression", n_estimators=200, learning_rate=0.05)
         lgb_model.fit(X, y)
 
-        start_date = df["DATE"].max()
+        start_date = pd.Timestamp.today().normalize()
         future_dates = []
         preds = []
 
-        last_df = df.copy()
         for i in range(1, 31):
             next_date = start_date + pd.Timedelta(days=i)
             features = {
@@ -124,18 +124,16 @@ def generate_forecast():
             X_next = pd.DataFrame([features])
             y_pred = lgb_model.predict(X_next)[0]
             preds.append(y_pred)
-            new_row = {"DATE": next_date, "YEAR": next_date.year, "MONTH": next_date.month,
-                       "DAY": next_date.day, "DOW": next_date.dayofweek, "REVENUE_VAL": y_pred}
-            last_df = pd.concat([last_df, pd.DataFrame([new_row])], ignore_index=True)
-            start_date = next_date
+            future_dates.append(next_date)
 
         lgb_forecast = np.array(preds)
-        future_dates = last_df.tail(30)["DATE"].values
     except Exception:
         future_dates = [pd.Timestamp.today().normalize() + pd.Timedelta(days=i) for i in range(1, 31)]
         lgb_forecast = np.repeat(df["REVENUE_VAL"].mean(), 30)
 
-    # --- 4) Combine ---
+    # --------------------------
+    # 4) Combine forecasts
+    # --------------------------
     def fix_array(arr):
         arr = np.array(arr, dtype=float)
         arr = np.where(np.isfinite(arr), arr, df["REVENUE_VAL"].mean())
@@ -146,20 +144,25 @@ def generate_forecast():
     lgb_arr = fix_array(lgb_forecast)
     combined = 0.3 * exp_arr + 0.3 * prop_arr + 0.4 * lgb_arr
 
-    # --- 5) Sunday closed (set revenue=0) ---
+    # Sundays = 0
     combined_corrected = []
     for d, val in zip(future_dates, combined):
         dow = pd.Timestamp(d).dayofweek
         combined_corrected.append(0.0 if dow == 6 else safe_float(val))
 
-    # --- 6) Recursive forecast chart data ---
-    chart_rows = [{"date": str(r["DATE"].date()), "revenue": safe_float(r["REVENUE_VAL"]), "type": "historical"} for _, r in df.iterrows()]
+    # --------------------------
+    # 5) Chart data + MAE
+    # --------------------------
+    chart_rows = [
+        {"date": str(r["DATE"].date()), "revenue": safe_float(r["REVENUE_VAL"]), "type": "historical"}
+        for _, r in df.iterrows()
+    ]
     for d, v in zip(future_dates, combined_corrected):
         chart_rows.append({"date": str(pd.Timestamp(d).date()), "revenue": safe_float(v), "type": "forecast"})
 
     daily_forecast = {str(pd.Timestamp(d).date()): safe_float(v) for d, v in zip(future_dates, combined_corrected)}
 
-    # --- 7) MAE (monthly scaled) ---
+    # MAE (monthly scaled)
     mae_val, mae_monthly = None, None
     try:
         insample_pred = np.array(es_fitted[-30:]) if len(es_fitted) >= 1 else np.repeat(df["REVENUE_VAL"].mean(), min(30, len(df)))
@@ -177,6 +180,7 @@ def generate_forecast():
         "chart_data": chart_rows,
         "daily_forecast": daily_forecast,
         "total_forecast": total_forecast,
+        "mae": mae_monthly,  # This ensures dashboard sees it
         "mae_daily": round(mae_val, 2) if mae_val is not None else None,
         "mae_monthly": mae_monthly
     }
@@ -185,7 +189,7 @@ def generate_forecast():
 
 
 # --------------------------
-# Routes
+# API Routes
 # --------------------------
 @app.route("/")
 def home():
@@ -202,8 +206,7 @@ def forecast_revenue():
     except Exception as e:
         tb = traceback.format_exc()
         print(tb)
-        msg = str(e)
-        return jsonify({"status": "error", "message": msg}), 500
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route("/api/revenue/history", methods=["GET", "OPTIONS"])
@@ -236,7 +239,7 @@ def download_forecast():
 
 
 # --------------------------
-# Run locally
+# Run Locally
 # --------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
