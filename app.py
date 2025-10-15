@@ -14,86 +14,67 @@ CORS(app, resources={r"/*": {"origins": ["https://campbelldentalsystem.site", "*
 EXCEL_PATH = "Dental_Revenue_2425.xlsx"
 
 # --------------------------
-# Utility Functions
+# Safe float
 # --------------------------
 def safe_float(x):
-    """Convert safely without killing valid numeric values."""
     try:
-        if isinstance(x, (np.floating, np.integer)):
-            return float(x)
-        f = float(x)
-        if not math.isfinite(f):
+        if pd.isna(x):
             return 0.0
-        return f
+        f = float(x)
+        return f if math.isfinite(f) else 0.0
     except Exception:
         return 0.0
 
 
 # --------------------------
-# Forecast Function
+# Forecast
 # --------------------------
 def generate_forecast():
     if not os.path.exists(EXCEL_PATH):
-        raise FileNotFoundError("Excel file not found")
+        raise FileNotFoundError(f"Excel not found: {EXCEL_PATH}")
 
     df = pd.read_excel(EXCEL_PATH)
     df.columns = [c.strip().upper() for c in df.columns]
+    if "REVENUE" not in df.columns:
+        raise ValueError("Expected column 'REVENUE'")
 
-    # Identify revenue column
-    if "REVENUE" in df.columns:
-        revenue_col = "REVENUE"
-    elif "AMOUNT" in df.columns:
-        revenue_col = "AMOUNT"
-    else:
-        raise ValueError("Excel must contain a REVENUE or AMOUNT column")
-
-    # Build DATE column
+    # Date handling
     if "DATE" in df.columns:
         df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
     else:
         df["DATE"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]], errors="coerce")
-
     df.dropna(subset=["DATE"], inplace=True)
     df = df.sort_values("DATE").reset_index(drop=True)
-    df[revenue_col] = pd.to_numeric(df[revenue_col], errors="coerce")
-    df = df.dropna(subset=[revenue_col])
+    df["REVENUE"] = pd.to_numeric(df["REVENUE"], errors="coerce").fillna(0)
 
-    print(f"✅ Loaded {len(df)} rows | Revenue sample:", df[revenue_col].head(5).tolist())
+    print(f"✅ Loaded {len(df)} rows, sample:", df["REVENUE"].head(3).tolist())
 
-    # ------------------------------
-    # Feature Engineering
-    # ------------------------------
+    # Features
     df["day_of_week"] = df["DATE"].dt.dayofweek
     df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(int)
     df["month"] = df["DATE"].dt.month
     df["is_payday"] = df["DATE"].dt.day.isin([15, 30]).astype(int)
     df["is_holiday"] = 0
 
-    # ------------------------------
-    # Exponential Smoothing
-    # ------------------------------
-    es_model = ExponentialSmoothing(df[revenue_col], trend="add")
+    # Exponential smoothing
+    es_model = ExponentialSmoothing(df["REVENUE"], trend="add")
     es_fit = es_model.fit()
-    df["ES_fitted"] = es_fit.fittedvalues
+    df["ES_fit"] = es_fit.fittedvalues
     es_forecast = es_fit.forecast(30)
 
-    # ------------------------------
-    # Prophet Forecast
-    # ------------------------------
-    prophet_df = df.rename(columns={revenue_col: "y", "DATE": "ds"})
-    prophet_model = Prophet(daily_seasonality=True)
-    prophet_model.fit(prophet_df)
-    prophet_pred = prophet_model.predict(prophet_model.make_future_dataframe(periods=30))
-    df["Prophet_fitted"] = prophet_pred["yhat"].iloc[:len(df)].values
-    prophet_forecast = prophet_pred.tail(30)["yhat"].values
+    # Prophet
+    prophet_df = df.rename(columns={"DATE": "ds", "REVENUE": "y"})
+    prophet = Prophet(daily_seasonality=True)
+    prophet.fit(prophet_df)
+    prophet_forecast = prophet.predict(prophet.make_future_dataframe(periods=30))
+    df["Prophet_fit"] = prophet_forecast["yhat"].iloc[:len(df)].values
+    prophet_future = prophet_forecast.tail(30)["yhat"].values
 
-    # ------------------------------
-    # LightGBM Forecast
-    # ------------------------------
+    # LightGBM (structure learner)
     features = ["day_of_week", "is_weekend", "month"]
     X = df[features]
-    y = df[revenue_col]
-    lgb_model = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.05, random_state=42)
+    y = df["REVENUE"]
+    lgb_model = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.05)
     lgb_model.fit(X, y)
 
     start_date = pd.Timestamp.today().normalize()
@@ -106,61 +87,52 @@ def generate_forecast():
         "is_payday": [1 if d.day in [15, 30] else 0 for d in future_dates],
         "is_holiday": [0]*30
     })
-    lgb_forecast = lgb_model.predict(future_df[features])
+    lgb_future = lgb_model.predict(future_df[features])
 
-    # ------------------------------
-    # Hybrid Combination
-    # ------------------------------
-    df["Hybrid_forecast"] = 0.3 * df["ES_fitted"] + 0.3 * df["Prophet_fitted"] + 0.4 * df[revenue_col]
+    # Hybrid combination
+    df["Hybrid_forecast"] = (
+        0.3 * df["ES_fit"] + 0.3 * df["Prophet_fit"] + 0.4 * df["REVENUE"]
+    )
     future_df["Hybrid_future_forecast"] = (
-        0.3 * es_forecast + 0.3 * prophet_forecast + 0.4 * lgb_forecast
+        0.3 * es_forecast + 0.3 * prophet_future + 0.4 * lgb_future
     )
 
-    # ------------------------------
-    # Residual Correction (Recursive)
-    # ------------------------------
-    df["y_smooth"] = df[revenue_col].rolling(3, min_periods=1).mean()
+    # Residual correction (recursive)
+    df["y_smooth"] = df["REVENUE"].rolling(3, min_periods=1).mean()
     df["Residual"] = df["y_smooth"] - df["Hybrid_forecast"]
-
     resid_features = ["day_of_week", "is_weekend", "is_payday", "month", "is_holiday"]
-    resid_model = lgb.LGBMRegressor(
-        n_estimators=300, learning_rate=0.05, random_state=42
-    )
+    resid_model = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.05)
     resid_model.fit(df[resid_features], df["Residual"])
-
     df["Residual_pred"] = resid_model.predict(df[resid_features])
     df["Hybrid_corrected"] = df["Hybrid_forecast"] + df["Residual_pred"]
-
     future_df["Residual_pred"] = resid_model.predict(future_df[resid_features])
     future_df["Hybrid_future_corrected"] = (
         future_df["Hybrid_future_forecast"] + future_df["Residual_pred"]
     )
 
-    # Sundays = 0
-    sunday_mask = future_df["day_of_week"] == 6
-    future_df.loc[sunday_mask, "Hybrid_future_corrected"] = 0.0
+    # Fix Sundays only
+    sunday_count = 0
+    for i in range(len(future_df)):
+        if future_df.loc[i, "day_of_week"] == 6:  # Sunday
+            sunday_count += 1
+            future_df.loc[i, "Hybrid_future_corrected"] = 0.0
+    print(f"📅 Sundays zeroed out: {sunday_count} days")
 
-    # ------------------------------
-    # Validate Non-Zero Forecasts
-    # ------------------------------
-    print("🔎 Future Forecast (first 5 values):", future_df["Hybrid_future_corrected"].head(5).tolist())
+    # Debug: preview values
+    print("🔍 Forecast preview:", future_df["Hybrid_future_corrected"].head(10).tolist())
 
-    # ------------------------------
-    # MAE
-    # ------------------------------
-    actual = df["y_smooth"].values
-    predicted = df["Hybrid_corrected"].values
-    mae = mean_absolute_error(actual, predicted)
+    # Metrics
+    mae = mean_absolute_error(df["y_smooth"], df["Hybrid_corrected"])
     mae_monthly = round(mae * 30, 2)
 
-    # ------------------------------
-    # Response
-    # ------------------------------
+    # Output
     daily_forecast = {
         str(d.date()): safe_float(v)
         for d, v in zip(future_df["DATE"], future_df["Hybrid_future_corrected"])
     }
     total_forecast = round(sum(daily_forecast.values()), 2)
+
+    print(f"✅ Total forecast sum: {total_forecast:,.2f} | MAE(monthly): {mae_monthly:,.2f}")
 
     chart_data = [
         {"date": str(d.date()), "revenue": safe_float(v), "type": "forecast"}
