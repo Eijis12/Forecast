@@ -7,8 +7,6 @@ import traceback
 import os
 import math
 from datetime import datetime
-
-# Forecasting libs
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import lightgbm as lgb
@@ -77,14 +75,13 @@ def load_holidays():
 
 
 # --------------------------
-# Forecasting (Dynamic Variation)
+# Core forecasting function
 # --------------------------
 def generate_forecast():
     if not os.path.exists(EXCEL_PATH):
         raise FileNotFoundError(f"Excel file not found: {EXCEL_PATH}")
 
     holidays_set = load_holidays()
-
     df = pd.read_excel(EXCEL_PATH)
     df.columns = [c.strip().upper() for c in df.columns]
 
@@ -120,11 +117,7 @@ def generate_forecast():
         raise ValueError("No valid data rows found after cleaning.")
 
     df["REVENUE"] = pd.to_numeric(df["AMOUNT"], errors="coerce").fillna(0.0).astype(float)
-    df["y_smooth"] = df["REVENUE"].astype(float)
-
-    # --------------------------
-    # Feature Engineering
-    # --------------------------
+    df["y_smooth"] = df["REVENUE"].rolling(window=7, center=True, min_periods=1).median()
     df["day_of_week"] = df["DATE"].dt.dayofweek
     df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(int)
     df["month"] = df["DATE"].dt.month
@@ -132,42 +125,20 @@ def generate_forecast():
     df["is_payday"] = df["DATE"].apply(lambda d: 1 if (d.day == 15 or is_last_day_of_month(d)) else 0)
     df["is_holiday"] = df["DATE"].dt.date.apply(lambda d: 1 if d in holidays_set else 0)
 
-    for lag in [1, 2, 3, 7, 14]:
-        df[f"lag_{lag}"] = df["REVENUE"].shift(lag).fillna(0.0)
-    df["roll_mean_3"] = df["REVENUE"].rolling(3, min_periods=1).mean().fillna(0.0)
-    df["roll_std_7"] = df["REVENUE"].rolling(7, min_periods=1).std().fillna(0.0)
-    df["is_month_end"] = df["DATE"].dt.is_month_end.astype(int)
-
-    # --------------------------
-    # Model Training
-    # --------------------------
-    features = [
-        "day_of_week", "is_weekend", "is_payday", "month", "is_holiday",
-        "lag_1", "lag_2", "lag_3", "lag_7", "roll_mean_3", "roll_std_7", "is_month_end"
-    ]
-
-    # LightGBM Model
+    # --- Exponential Smoothing ---
     try:
-        X = df[features]
-        y = df["y_smooth"]
-        lgb_model = lgb.LGBMRegressor(n_estimators=500, learning_rate=0.05, num_leaves=31)
-        lgb_model.fit(X, y)
-        lgb_insample = lgb_model.predict(X)
+        es_model = ExponentialSmoothing(df["y_smooth"], trend="add", seasonal=None)
+        es_fit = es_model.fit(optimized=True)
+        es_insample = es_fit.fittedvalues
     except Exception:
-        lgb_model = None
-        lgb_insample = np.repeat(df["y_smooth"].mean(), len(df))
+        es_insample = np.repeat(df["y_smooth"].mean(), len(df))
 
-    # Prophet Model
+    # --- Prophet ---
     try:
         prophet_df = df[["DATE", "y_smooth"]].rename(columns={"DATE": "ds", "y_smooth": "y"})
-        prophet_model = Prophet(
-            weekly_seasonality=True,
-            daily_seasonality=False,
-            changepoint_prior_scale=0.25,
-            seasonality_prior_scale=12.0,
-            seasonality_mode="add"
-        )
+        prophet_model = Prophet(daily_seasonality=True)
         prophet_model.fit(prophet_df)
+        start_dt = pd.Timestamp.today().normalize()
         future_prophet = prophet_model.make_future_dataframe(periods=30, freq="D")
         prophet_pred_full = prophet_model.predict(future_prophet)
         prophet_insample = prophet_pred_full.loc[: len(prophet_df)-1, "yhat"].values
@@ -176,71 +147,54 @@ def generate_forecast():
         prophet_insample = np.repeat(df["y_smooth"].mean(), len(df))
         prophet_future = np.repeat(df["y_smooth"].mean(), 30)
 
-    # Exponential Smoothing Model
+    # --- LightGBM ---
     try:
-        es_model = ExponentialSmoothing(df["y_smooth"], trend="add", seasonal="add", seasonal_periods=7)
-        es_fit = es_model.fit(optimized=True)
-        es_insample = es_fit.fittedvalues
-        es_forecast_future = es_fit.forecast(30)
+        features = ["day_of_week", "is_weekend", "is_payday", "month", "is_holiday"]
+        X = df[features]
+        y = df["y_smooth"]
+        lgb_model = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.05)
+        lgb_model.fit(X, y)
+        lgb_insample = lgb_model.predict(X)
     except Exception:
-        es_insample = np.repeat(df["y_smooth"].mean(), len(df))
-        es_forecast_future = np.repeat(df["y_smooth"].mean(), 30)
+        lgb_model = None
+        lgb_insample = np.repeat(df["y_smooth"].mean(), len(df))
 
-    # --------------------------
-    # Future DataFrame
-    # --------------------------
+    # --- Future data ---
     future_start = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
     future_dates = pd.date_range(start=future_start, periods=30, freq="D").to_pydatetime().tolist()
     future_df = pd.DataFrame({"DATE": pd.to_datetime(future_dates)})
-
     future_df["day_of_week"] = future_df["DATE"].dt.dayofweek
     future_df["is_weekend"] = future_df["day_of_week"].isin([5, 6]).astype(int)
     future_df["month"] = future_df["DATE"].dt.month
     future_df["day"] = future_df["DATE"].dt.day
     future_df["is_payday"] = future_df["DATE"].apply(lambda d: 1 if (d.day == 15 or is_last_day_of_month(d)) else 0)
     future_df["is_holiday"] = future_df["DATE"].dt.date.apply(lambda d: 1 if d in holidays_set else 0)
-    future_df["is_month_end"] = future_df["DATE"].dt.is_month_end.astype(int)
-    for lag in [1, 2, 3, 7, 14]:
-        future_df[f"lag_{lag}"] = df["REVENUE"].iloc[-lag] if len(df) >= lag else df["REVENUE"].mean()
-    future_df["roll_mean_3"] = df["REVENUE"].tail(3).mean()
-    future_df["roll_std_7"] = df["REVENUE"].tail(7).std()
 
     if lgb_model is not None:
-        lgb_future = lgb_model.predict(future_df[features])
+        try:
+            lgb_future = lgb_model.predict(future_df[features])
+        except Exception:
+            lgb_future = np.repeat(df["y_smooth"].mean(), 30)
     else:
         lgb_future = np.repeat(df["y_smooth"].mean(), 30)
 
-    # --------------------------
-    # Hybrid Forecast (Dynamic)
-    # --------------------------
-    def fix_arr(a, fallback_mean):
-        a = np.array(a, dtype=float)
-        a = np.where(np.isfinite(a), a, float(fallback_mean))
-        return a
+    try:
+        es_forecast_future = es_fit.forecast(30)
+    except Exception:
+        es_forecast_future = np.repeat(df["y_smooth"].mean(), 30)
 
-    es_arr = fix_arr(es_forecast_future, df["y_smooth"].mean())
-    prop_arr = fix_arr(prophet_future, df["y_smooth"].mean())
-    lgb_arr = fix_arr(lgb_future, df["y_smooth"].mean())
+    es_arr = np.array(es_forecast_future)
+    prop_arr = np.array(prophet_future)
+    lgb_arr = np.array(lgb_future)
+    hybrid_future = 0.30 * es_arr + 0.30 * prop_arr + 0.40 * lgb_arr
 
-    # Combine hybrid model with realistic variation
-    hybrid_future = 0.25 * es_arr + 0.35 * prop_arr + 0.40 * lgb_arr
-
-    np.random.seed(42)
-    variation = np.random.uniform(-0.15, 0.15, size=len(hybrid_future))
-    hybrid_future = hybrid_future * (1 + variation)
-    hybrid_future = np.clip(hybrid_future, 10000, 22000)
-
-    # Apply Sunday=0
-    hybrid_future_clean = []
+    hybrid_future_corrected_clean = []
     for d, val in zip(future_df["DATE"], hybrid_future):
         if int(pd.Timestamp(d).dayofweek) == 6:
-            hybrid_future_clean.append(0.0)
+            hybrid_future_corrected_clean.append(0.0)
         else:
-            hybrid_future_clean.append(float(safe_float(val, 0.0)))
+            hybrid_future_corrected_clean.append(float(safe_float(val, 0.0)))
 
-    # --------------------------
-    # Output
-    # --------------------------
     chart_data = []
     for _, row in df.iterrows():
         chart_data.append({
@@ -248,29 +202,33 @@ def generate_forecast():
             "revenue": safe_float(row["REVENUE"], 0.0),
             "type": "historical"
         })
-    for d, v in zip(future_df["DATE"], hybrid_future_clean):
+    for d, v in zip(future_df["DATE"], hybrid_future_corrected_clean):
         chart_data.append({
             "date": str(pd.Timestamp(d).date()),
             "revenue": safe_float(v, 0.0),
             "type": "forecast"
         })
 
-    daily_forecast = {str(pd.Timestamp(d).date()): safe_float(v, 0.0) for d, v in zip(future_df["DATE"], hybrid_future_clean)}
-    total_forecast = float(round(sum(hybrid_future_clean), 2))
+    daily_forecast = { str(pd.Timestamp(d).date()): safe_float(v, 0.0) for d, v in zip(future_df["DATE"], hybrid_future_corrected_clean) }
+    total_forecast = float(round(sum(hybrid_future_corrected_clean), 2))
 
-    # MAE
+    # --- ✅ FIXED MAE SECTION ---
     mae_daily = None
     mae_monthly = None
     try:
-        actual = np.array(df["y_smooth"].values[-30:]) if len(df) > 0 else np.array([])
+        actual = np.array(df["y_smooth"].values[-30:])
         pred = np.array(lgb_insample[-30:])
         n = min(len(actual), len(pred))
         if n > 0:
             mae_val = mean_absolute_error(actual[-n:], pred[-n:])
             mae_daily = float(round(mae_val, 2))
-            mae_monthly = float(round(mae_daily * 30.0, 2))
+            mae_monthly = float(round(mae_daily * 30.0, 2))  # multiplied by 30
+        else:
+            mae_daily = None
+            mae_monthly = None
     except Exception:
-        pass
+        mae_daily = None
+        mae_monthly = None
 
     result = {
         "chart_data": chart_data,
@@ -284,7 +242,7 @@ def generate_forecast():
 
 
 # --------------------------
-# API Routes
+# API routes
 # --------------------------
 @app.route("/")
 def home():
@@ -330,8 +288,5 @@ def download_forecast():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# --------------------------
-# Run (dev)
-# --------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
