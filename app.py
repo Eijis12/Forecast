@@ -46,7 +46,7 @@ def sanitize(obj):
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
-        v = float(obj)
+        v = float(v)
         return v if math.isfinite(v) else 0.0
     if isinstance(obj, float):
         return obj if math.isfinite(obj) else 0.0
@@ -99,7 +99,9 @@ def generate_forecast():
 
     if not required.issubset(set(df.columns)):
         if not ("DATE" in df.columns and "AMOUNT" in df.columns):
-            raise ValueError(f"Excel must contain columns: YEAR, MONTH, DAY, AMOUNT (or DATE + AMOUNT). Found: {df.columns.tolist()}")
+            raise ValueError(
+                f"Excel must contain columns: YEAR, MONTH, DAY, AMOUNT (or DATE + AMOUNT). Found: {df.columns.tolist()}"
+            )
 
     df["AMOUNT"] = pd.to_numeric(df["AMOUNT"], errors="coerce")
 
@@ -289,6 +291,54 @@ def generate_forecast():
 @app.route("/")
 def home():
     return jsonify({"message": "Revenue Forecast API active"}), 200
+
+
+# ============================
+# 📘 ROUTE: Get All Sales Data
+# ============================
+@app.route("/api/revenue/sales", methods=["GET"])
+def get_sales():
+    try:
+        if not os.path.exists(EXCEL_PATH):
+            return jsonify([]), 200
+        df = pd.read_excel(EXCEL_PATH)
+        df = df.sort_values(by="DATE", ascending=True)
+        sales = df.to_dict(orient="records")
+        return jsonify(sales), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"message": "Failed to read Excel file"}), 500
+
+
+# ============================
+# ➕ ROUTE: Add New Sale
+# ============================
+@app.route("/api/revenue/add-sale", methods=["POST"])
+def add_sale():
+    try:
+        data = request.get_json()
+        date = data.get("date")
+        revenue = data.get("revenue")
+
+        if not date or revenue is None:
+            return jsonify({"message": "Missing date or revenue"}), 400
+
+        if os.path.exists(EXCEL_PATH):
+            df = pd.read_excel(EXCEL_PATH)
+        else:
+            df = pd.DataFrame(columns=["DATE", "REVENUE"])
+
+        new_row = pd.DataFrame([{"DATE": pd.to_datetime(date), "REVENUE": float(revenue)}])
+        df = pd.concat([df, new_row], ignore_index=True)
+
+        df = df.sort_values("DATE").reset_index(drop=True)
+        df.to_excel(EXCEL_PATH, index=False)
+
+        return jsonify({"message": "Sale added successfully"}), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"message": "Failed to update Excel file"}), 500
 
 
 @app.route("/api/revenue/forecast", methods=["POST", "OPTIONS"])
