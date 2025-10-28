@@ -368,16 +368,58 @@ def get_history():
 def download_forecast():
     try:
         result = generate_forecast()
-        df_out = pd.DataFrame(list(result["daily_forecast"].items()), columns=["Date", "Forecasted_Revenue"])
-        df_out.loc[len(df_out)] = ["Total (₱)", result.get("total_forecast", 0.0)]
+
+        # Base DataFrame for forecast
+        df_out = pd.DataFrame(
+            list(result["daily_forecast"].items()),
+            columns=["Date", "Forecasted_Revenue"]
+        )
+
+        # Try to read actual revenue from query (if frontend sends it)
+        # Example: ?actuals={"2025-10-01":10000,"2025-10-02":12000}
+        actuals_json = request.args.get("actuals")
+        actuals = json.loads(actuals_json) if actuals_json else {}
+
+        # Add Actual Revenue and Difference columns
+        df_out["Actual_Revenue"] = df_out["Date"].map(actuals).fillna("")
+        df_out["Difference"] = df_out.apply(
+            lambda r: (r["Actual_Revenue"] - r["Forecasted_Revenue"])
+            if isinstance(r["Actual_Revenue"], (int, float)) else "",
+            axis=1
+        )
+
+        # Add Total Row
+        total_forecast = result.get("total_forecast", 0.0)
+        total_actual = (
+            df_out["Actual_Revenue"].sum()
+            if pd.api.types.is_numeric_dtype(df_out["Actual_Revenue"])
+            else ""
+        )
+        total_diff = (
+            total_actual - total_forecast
+            if isinstance(total_actual, (int, float)) else ""
+        )
+
+        total_row = pd.DataFrame({
+            "Date": ["Total (₱)"],
+            "Forecasted_Revenue": [total_forecast],
+            "Actual_Revenue": [total_actual],
+            "Difference": [total_diff]
+        })
+        df_out = pd.concat([df_out, total_row], ignore_index=True)
+
+        # Write to Excel
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
             df_out.to_excel(writer, index=False, sheet_name="Forecast_30_Days")
+
         output.seek(0)
         return send_file(output, as_attachment=True, download_name="RevenueForecast.xlsx")
+
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
+
 
 
 # --------------------------
@@ -385,3 +427,4 @@ def download_forecast():
 # --------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
